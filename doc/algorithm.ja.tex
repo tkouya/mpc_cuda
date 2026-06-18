@@ -1,0 +1,601 @@
+% algorithm.ja.tex -- mpc_cuda のアルゴリズム（日本語版）
+%
+% MPFR の "algorithms.tex" に倣い、(i) 実行時 cu_mpfr/cu_mpc 層が上流 MPFR/MPC
+% と異なる箇所、(ii) コンパイル時固定精度・レジスタ常駐型 cu_freal<PB> /
+% cu_fcomplex<PB> とその初等関数、を論文から引用できる形で自己完結的に記述する。
+%
+% ビルド（外部図ファイル不要）:
+%     uplatex algorithm.ja.tex && uplatex algorithm.ja.tex && dvipdfmx algorithm.ja
+%
+\documentclass[uplatex,dvipdfmx,a4paper,11pt]{jsarticle}
+
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage[margin=25mm]{geometry}
+\usepackage[dvipdfmx]{graphicx}
+\usepackage[dvipdfmx]{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{positioning,calc,arrows.meta,fit,backgrounds,decorations.pathreplacing,decorations.pathmorphing}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage[dvipdfmx,hidelinks]{hyperref}
+\usepackage{pxjahyper}
+
+\floatname{algorithm}{アルゴリズム}
+\renewcommand{\algorithmicrequire}{\textbf{入力:}}
+\renewcommand{\algorithmicensure}{\textbf{出力:}}
+\renewcommand{\algorithmicreturn}{\textbf{返す}}
+\renewcommand{\algorithmicif}{\textbf{もし}}
+\renewcommand{\algorithmicthen}{\textbf{ならば}}
+\renewcommand{\algorithmicelse}{\textbf{そうでなければ}}
+\renewcommand{\algorithmicend}{\textbf{終了}}
+
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\freal}{\code{cu\_freal}}
+\newcommand{\fcomplex}{\code{cu\_fcomplex}}
+\newcommand{\PB}{\ensuremath{p}}
+\newcommand{\Nlimb}{\ensuremath{N}}
+\newcommand{\round}{\ensuremath{\circ}}
+\newcommand{\ulp}{\textsc{ulp}}
+\newcommand{\rndn}{\textsc{rndn}}
+\newcommand{\fmma}{\ensuremath{\operatorname{fmma}}}
+\newcommand{\fmms}{\ensuremath{\operatorname{fmms}}}
+
+\title{\textbf{\code{mpc\_cuda} のアルゴリズム}\\[2pt]
+{\large 正しく丸められる多倍長演算と，CUDA 向けレジスタ常駐\\
+固定精度高速パス}}
+\author{tkouya}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+\code{mpc\_cuda} は GNU 多倍長演算スタック---GMP（整数），MPFR（正しく丸められる
+2 進浮動小数点），MPC（複素数）---を移植し，ホスト・デバイス双方の CUDA カーネル
+内で動作させる。本稿は，MPFR の \texttt{algorithms.tex} に倣って\emph{アルゴリズム}
+を記述し，論文から引用できることを意図する。2 つの層を区別する。\emph{実行時}層
+（\code{cu\_mpfr\_*}，\code{cu\_mpc\_*}）は上流 MPFR/MPC のアルゴリズムをそのまま
+再現し，アルゴリズム的な置き換えは 1 つだけ---\code{nvcc} 下で誤コンパイルされる
+MPFR の汎用除算パスを，\code{mpz} に基づく正しく丸められる除算で置き換える---である。
+\emph{固定精度}層は，精度 \PB{} をコンパイル時定数とするレジスタ常駐型
+\code{cu\_freal<\PB>} と \code{cu\_fcomplex<\PB>} を提供する。その基本算術は
+MPFR の最近接偶数丸め（\rndn）および MPC の成分ごとの \code{MPC\_RNDNN} と
+ビット単位で一致し，初等関数は\emph{忠実（faithful）}（高精度，$\lesssim 1\,\ulp$，
+正しく丸められるわけではない）である。格納モデル，丸めの中核，スクールブック乗算，
+複素乗算を正しく丸める厳密融合 \fmms/\fmma，および初等関数の作業精度 Newton 法／
+引数簡約方式を与える。さらにデバイス上で実行時層を高速化する要となるメモリ機構
+（スレッドごとのバンプアリーナ）も記述する。
+\end{abstract}
+
+\tableofcontents
+
+\section{範囲と 2 つの層}
+\label{sec:scope}
+
+\code{mpc\_cuda} は相互運用可能な 2 つの数値層を提供する。それぞれの丸め契約を
+表~\ref{tab:layers} にまとめる。
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}p{0.24\linewidth}p{0.34\linewidth}p{0.31\linewidth}@{}}
+\toprule
+ & \textbf{実行時層} & \textbf{固定精度層}\\
+ & \code{cu\_mpfr\_t}，\code{cu\_mpc\_t} & \code{cu\_freal<\PB>}，\code{cu\_fcomplex<\PB>}\\
+\midrule
+精度        & 実行時（オブジェクトごと） & コンパイル時定数 \PB\\
+格納        & ヒープ／バンプアリーナ（limb 配列） & レジスタ（$\lceil \PB/64\rceil$ limb）\\
+丸めモード  & MPFR/MPC 全モード（引数） & \rndn{} のみ（引数なし）\\
+基本算術    & 上流 MPFR/MPC アルゴリズム & MPFR \rndn{} / \code{MPC\_RNDNN} とビット一致\\
+除算        & \code{mpz} 置換（\S\ref{sec:div}） & Newton 逆数（\S\ref{sec:elem}）\\
+初等関数    & 上流 MPFR/MPC（正しく丸め） & 忠実，$\lesssim 1\,\ulp$（\S\ref{sec:elem}）\\
+\bottomrule
+\end{tabular}
+\caption{\code{mpc\_cuda} の 2 つの数値層と丸め契約。}
+\label{tab:layers}
+\end{table}
+
+両層は同じ数値モデルを共有する。これを先に固定する。
+
+\paragraph{数値モデル.}
+MPFR に従い，精度 \PB{} ビットの 0 でない有限数は
+\begin{equation}
+x \;=\; s \cdot m \cdot 2^{\,e-\PB},
+\qquad s\in\{-1,+1\},\quad 2^{\PB-1}\le m < 2^{\PB},\ m\in\mathbb{Z},
+\label{eq:model}
+\end{equation}
+すなわち符号，最上位ビット（MSB）が立った \PB{} ビット整数仮数 $m$，および指数 $e$
+である。0 は別個のフラグ付き値である。仮数は $\Nlimb=\lceil \PB/64\rceil$ 個の
+64 ビット limb に\emph{左詰め}（MSB が最上位 limb の最上位ビット）で格納し，
+$\mathit{SB}=64\Nlimb-\PB\in\{0,32\}$ の下位ビットは 0 に保つ。これは MPFR の
+メモリ配置そのものであり，結果をホスト MPFR とビット単位で比較できる理由である。
+
+\medskip
+\noindent
+以降の構成は次のとおり。実行時層と MPFR からの唯一のアルゴリズム的逸脱
+（\S\ref{sec:runtime}），固定精度実数型（\S\ref{sec:freal}），固定精度複素数型と
+それを正しく丸める厳密融合乗算（\S\ref{sec:fcomplex}），固定精度初等関数
+（\S\ref{sec:elem}）。\S\ref{sec:accuracy} で精度保証と検証を，\S\ref{sec:cite} で
+引用方法をまとめる。
+
+
+\section{実行時層：MPFR/MPC からの逸脱}
+\label{sec:runtime}
+
+実行時層は，上流 GMP/MPFR/MPC ソースから機械的移植（\code{cu\_} 接頭辞付与，
+ホスト／デバイス修飾，ホスト専用 I/O の除去）で生成される。\emph{アルゴリズム的には
+上流 MPFR/MPC そのもの}であり，加算・減算・乗算・平方根・定数・全超越関数は MPFR
+自身のルーチンと Ziv の正しく丸めるループを用いる。したがってデバイス上でも，
+すべての丸めモードでホスト MPFR と同じビットを返す。複素層は MPC のままで，
+実部・虚部はパックされた丸めモード \code{MPC\_RND}$(r_\Re,r_\Im)$ で独立に丸められる。
+引用のために記録すべき点は 2 つ：丸めの意味論が上流と同一であること，そして算術
+カーネルの置き換えがちょうど 1 つだけであること。さらに，実行時層を単に「正しい」
+だけでなく「高速」にする上で本質的なデバイス固有機構---メモリアロケータ
+（\S\ref{sec:arena}）---も記述に値する。
+
+\subsection{メモリ管理：スレッドごとのバンプアリーナ}
+\label{sec:arena}
+
+すべての多倍長演算はメモリを確保する。\code{mpfr\_t} は limb 用のバッファを必要とし，
+1 回の \code{cu\_mpfr\_div} や \code{cu\_mpc\_mul} は呼び出し連鎖を降りながら\emph{数十}
+個の一時変数を確保・解放する。CPU では安価だが，デバイスの \code{malloc}/\code{free}
+は全スレッドが共有する単一のグローバル直列化アロケータであり，数千スレッドが競合すると
+支配的コストになる---本ライブラリでは，GPU が CPU と同等にとどまるか
+$\sim\!40\times$ 高速になるかの分かれ目であった。これは純粋に実装上の関心事
+（結果は変わらない）だが，実行時層を大規模に使える理由なので，ここに記す。
+
+\code{mpc\_cuda} はデバイスヒープを\emph{スレッドごとのバンプアリーナ}で置き換える。
+すなわち，1 つの連続した \code{cudaMalloc} 確保ブロックを，常駐スレッドごとに 1 つの
+固定サイズ\emph{スラブ}へ分割し，グローバルスレッド ID で添字付けする
+（図~\ref{fig:arena}）。3 つの操作は次のとおり。
+\begin{itemize}
+  \item \textbf{確保（Allocate）}$=$ 要求サイズをスレッドのオフセット
+        \code{mpc\_cuda\_arena\_top[tid]} に加え，加える前の位置を返す。
+        命令数個，探索もロックもなく，\emph{スレッド間競合なし}
+        （スレッドは互いのスラブに触れない）。
+  \item \textbf{解放（Free）}$=$ \emph{何もしない}（no-op）。
+  \item \textbf{リセット（Reset）}$=$ スレッドのオフセットを 0 に戻し，そのスレッドの
+        スクラッチ領域全体を一括回収する。
+\end{itemize}
+解放が no-op なので，2 回のリセットの間に確保したものはすべて生存し続ける。
+すなわちアリーナは汎用ヒープではなく，\emph{1 単位の作業のためのスクラッチパッド}
+である。カーネルは 1 つの作業項目に必要な確保をすべて行い，次の項目の前に
+\code{mpc\_cuda\_arena\_reset()} を呼ぶ。同じフックが mini-GMP と，
+\code{mpfr-gmp.c} を介して MPFR・MPC の両方を裏付けるので，アリーナの導入は全層を
+一度に高速化する。サイズ設定によらず結果の正しさを保つ 2 つのフォールバックがある。
+アリーナ未導入（$\code{mpc\_cuda\_arena\_base}=\texttt{NULL}$）なら確保はデバイス
+\code{malloc}/\code{free} に向かう。作業項目がスラブを超過したら，\emph{その}確保は
+静かに \code{malloc} へあふれ，通常どおり解放される。したがって超過は性能を損なうが，
+正しさは決して損なわない。
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[x=1mm,y=1mm,font=\small]
+  \def\w{34}
+  \foreach \i/\lab in {0/{thread 0},1/{thread 1},2/{thread 2},3/{$\cdots$}}{
+    \draw (\i*\w,0) rectangle (\i*\w+\w,12);
+    \draw[dashed] (\i*\w,8) -- (\i*\w+\w,8);
+    \node at (\i*\w+\w/2,10) {\lab};
+    \node[font=\scriptsize,gray] at (\i*\w+\w/2,4) {SLAB bytes};
+  }
+  % スラブ 0 内のバンプ矢印（確保は上方向に伸びる）
+  \draw[-{Latex},thick] (2.5,1.2) -- (2.5,7.6);
+  \draw[-{Latex}] (1.5,-6) -- (1.5,-0.5);
+  \node[anchor=north,font=\scriptsize] at (12,-6) {\code{mpc\_cuda\_arena\_base}};
+  \node[anchor=west,font=\scriptsize] at (\w+22,-6)
+    {\code{arena\_top[tid]} $=$ スレッドごとの最高水準};
+\end{tikzpicture}
+\caption{スレッドごとのバンプアリーナ：1 つの \code{cudaMalloc} ブロックを，常駐
+スレッドごとの固定サイズスラブに分割する。確保はスレッドのオフセットを上げ，解放は
+no-op，リセットは 0 に戻す。2 スレッドがスラブを共有しないため競合がない。}
+\label{fig:arena}
+\end{figure}
+
+\paragraph{サイズ設定.}
+アリーナ総量は $\textsc{launch}\times\textsc{slab}$ である。\textsc{launch} は常駐
+スレッドの固定数（占有率のため選ぶ---深い呼び出し連鎖は limb をグローバルメモリの
+スラブに保持するので，その遅延を隠すには多数のワープが必要），\textsc{slab} は
+スレッドごとのスクラッチで，1 作業項目の同時生存確保のピークを収める必要がある。
+解放が no-op なので，そのピークは最後のリセット以降に確保した総量に等しく，直接
+測定できる：\code{mpc\_cuda\_arena\_top[tid]} が最高水準そのものなので，1 作業項目を
+リセットせずに実行すれば正確なバイト数が分かる。スクラッチは精度にほぼ線形に
+スケールし，経験的には（1024 ビットで）実数 MPFR の \code{axpy}／内積は
+スレッドあたり $\approx 32$\,KB，複素数 MPC では $\approx 256$\,KB（約 $8\times$，
+複素連鎖がより深い）を要する。過剰割り当てはメモリを費やすだけだが，過少割り当ては
+静かに低速パスへ落とす。
+
+\subsection{デバイスで正しい除算}
+\label{sec:div}
+
+MPFR の汎用除算（\code{mpfr\_div}，\cite{HarveyZimmermann,MollerGranlund} の
+分割統治／短除算パス）は，3 limb 以上の精度に対して \code{nvcc} 下で誤コンパイル
+され，デバイス上で \code{inf} やゴミを返す。原因は最適化器に絞り込まれたが，問題の
+構文の特定には至らず，一方で下位の構成要素（\code{mpn\_divrem}，mini-GMP の
+\code{mpz} 除算，\code{udiv\_qrnnd}，\code{count\_leading\_zeros}）はいずれもデバイス
+上で\emph{正しさを検証済み}である。そこで \code{mpc\_cuda} は，デバイス上に限り，
+信頼できる \code{mpz} プリミティブのみで構成した自己完結的で正しく丸められる除算を
+代わりに用いる（ホストは上流 MPFR を保持）。除算は定数と超越関数の基盤
+（内部で除算する）なので，この置き換えが実行時層全体を解放する。
+
+\begin{algorithm}[h]
+\caption{\code{mpfr\_div\_cuda}$(u,v,\mathit{rnd})$：デバイスで正しい，正しく丸められる除算}
+\label{alg:div}
+\begin{algorithmic}[1]
+\Require 有限で 0 でない $u,v$，精度は宛先 $q$（\PB{} ビット）以下；特異ケース（$0,\infty,\mathrm{NaN}$）は MPFR と同様に別処理。
+\State $s \gets \operatorname{sign}(u)\cdot\operatorname{sign}(v)$
+\State $u,v$ の仮数を整数 $M_u,M_v$（\code{mpz}）として構築
+\State $\mathit{shift} \gets \PB + 2 + (v \text{の limb 数})\cdot 64$ \Comment{厳密な商 1 個分のガードビット}
+\State $\mathit{num} \gets M_u \ll \mathit{shift}$
+\State $(Q,R) \gets \code{mpz\_tdiv\_qr}(\mathit{num},\,M_v)$ \Comment{厳密な整数除算 1 回}
+\State 丸めビットと sticky ビットを導出（$\mathit{sticky}=[R\neq 0]$ と $Q$ の落とした下位ビットの論理和）
+\State $Q$ を \PB{} ビットに正規化，商の指数を $e_u-e_v$ とシフトから設定
+\State 丸めモード $\mathit{rnd}$ を $(Q,\text{round},\text{sticky})$ に適用；符号 $s$ を設定
+\State \Return \code{mpfr\_check\_range}$(q)$ \Comment{ホスト \code{mpfr\_div} とビット一致}
+\end{algorithmic}
+\end{algorithm}
+
+商は，被除数を $\PB+2$ ガードビット（さらに除数 1 個分）だけシフトしたものに対する
+単一の \code{mpz\_tdiv\_qr} で形成する（整数商に目標仮数・丸めビット・sticky 判定に
+十分な材料が既に含まれる）。続く丸めは\emph{すべて}の丸めモードについて MPFR を
+正確に踏襲するので，公開関数 \code{cu\_mpfr\_div} はホスト \code{mpfr\_div} と
+ビット一致する。コストは $O(\PB)$ limb の大整数除算 1 回で，MPFR のパスと漸近的に
+同クラスであり，呼び出し側からは透過的である。
+
+\subsection{ホスト専用の関数}
+書式付き・文字列 I/O（\code{mpfr\_printf}，\code{mpfr\_get\_str} のパース，
+\code{mpfr\_set\_str}，\code{mpz\_out\_str}，\ldots）と，mini-GMP にない
+\code{mpf\_t}/\code{mpq\_t} 変換はデバイスでは利用できない（デバイススタブは呼ばれると
+トラップする）。これらはアルゴリズム的変更ではなく表層的制約だが，カーネルが
+呼べる範囲を画する。
+
+
+\section{固定精度実数型 \texorpdfstring{\code{cu\_freal<\PB>}}{cu\_freal<PB>}}
+\label{sec:freal}
+
+精度がコンパイル時に既知のとき，\code{cu\_freal<\PB>}（ヘッダ \code{cu\_freal.cuh}）は
+数全体をレジスタに保持し，アリーナと実行時精度ディスパッチを不要にする。\PB{} は
+32 の任意の正の倍数（よって $\mathit{SB}\in\{0,32\}$）であり，仮数は
+$\Nlimb=\lceil\PB/64\rceil$ limb を占める。すべての演算が MPFR \rndn{} とビット一致する。
+
+\subsection{格納}
+\label{sec:freal-storage}
+
+値は \eqref{eq:model} を実現する三つ組 \code{(sign, exp, m[N])} である：
+\code{sign}$\in\{\pm1\}$，\code{exp} は MPFR 指数，\code{m} は左詰めの仮数
+（図~\ref{fig:layout}）。予約指数で 0 を表す。配置が MPFR と一致するため，同精度の
+実行時 \code{cu\_mpfr\_t} との相互変換は単なるコピーである。
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[x=1mm,y=1mm,font=\small]
+  \def\w{26}
+  \foreach \i/\lab in {0/{m[N-1]},1/{m[N-2]},2/{$\cdots$},3/{m[0]}}{
+    \draw (\i*\w,0) rectangle (\i*\w+\w,8);
+    \node at (\i*\w+\w/2,4) {\lab};
+  }
+  \draw[-{Latex}] (1,14) -- (1,8.5);
+  \node[anchor=south] at (1,14) {MSB $=1$（bit $64N-1$，weight $2^{e-1}$）};
+  \draw[-{Latex}] (3*\w+\w-1,14) -- (3*\w+\w-1,8.5);
+  \node[anchor=south,align=center] at (3*\w+\w-1,14) {下位 $\mathit{SB}$ bits $=0$\\（$\mathit{SB}=64N-\PB$）};
+  \draw[decorate,decoration={brace,amplitude=4pt,mirror}] (0.5,-2) -- (3*\w+\w-1.5,-2)
+    node[midway,below=4pt] {\PB{} 有効ビット，その後 $\mathit{SB}$ 個の 0};
+\end{tikzpicture}
+\caption{\code{cu\_freal<\PB>} の左詰め仮数：$\Nlimb$ limb を上位から下位へ，MSB は
+常に立ち，下位 $\mathit{SB}$ ビットは 0 に固定。MPFR のメモリ配置と同一。}
+\label{fig:layout}
+\end{figure}
+
+\subsection{丸めの中核 \texttt{finalize}}
+\label{sec:finalize}
+
+すべての実数演算は 1 つのルーチン \code{finalize} に集約される。これは厳密な大きさ
+（MSB 位置と指数が既知のリトルエンディアン limb バッファ $D$ と，$D$ の\emph{下}に
+ある丸め／sticky 材料）を受け取り，\rndn{} で丸めた \code{cu\_freal<\PB>} を生成する。
+この単一の丸め点こそが，本型が MPFR とビット一致することを保証する根拠である：
+下の各カーネルは\emph{厳密な}中間値を形成して \code{finalize} に渡すことだけに責任を負う。
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[x=1mm,y=1mm,font=\small]
+  \draw (0,0) rectangle (60,8); \node at (30,4) {保持：\PB{} bits $[\,lo\,..\,\mathit{msb}\,]$};
+  \draw (60,0) rectangle (70,8); \node at (65,4) {$r$};
+  \draw[fill=black!8] (70,0) rectangle (95,8); \node at (82.5,4) {sticky $\;t$};
+  \node[anchor=south] at (30,9) {結果の仮数};
+  \node[anchor=south] at (65,9) {丸めビット};
+  \node[anchor=south] at (82.5,9) {下位全ビットの OR};
+  \draw[decorate,decoration={brace,amplitude=4pt,mirror}] (0,-2) -- (95,-2)
+    node[midway,below=4pt] {厳密中間値 $D$（bit $0$ より下は $b_{\mathrm{rnd}},b_{\mathrm{sti}}$ として持ち込む）};
+\end{tikzpicture}
+\caption{\code{finalize} が用いる判定ビット：保持する \PB{} ビット，そのすぐ下の
+丸めビット $r$，sticky ビット $t$（それより下のすべての論理和）。最近接偶数丸めは
+$r\wedge(t\vee \text{lsb})$ のとき切り上げる。}
+\label{fig:round}
+\end{figure}
+
+\begin{algorithm}[h]
+\caption{\code{finalize}$(D,\mathit{msb},E_{\mathrm{hi}},b_{\mathrm{rnd}},b_{\mathrm{sti}},s)$}
+\label{alg:finalize}
+\begin{algorithmic}[1]
+\State $lo \gets \mathit{msb}-\PB+1$ \Comment{$D$ 内で保持する最下位ビット位置}
+\If{$lo>0$}
+  \State $V \gets D$ の bit $[\,lo\,..\,lo+\PB-1\,]$;\quad $r \gets D_{lo-1}$;\quad $t \gets b_{\mathrm{rnd}}\vee b_{\mathrm{sti}}\vee \big(\textstyle\bigvee_{i<lo-1} D_i\big)$
+\ElsIf{$lo=0$}
+  \State $V \gets D$;\quad $r \gets b_{\mathrm{rnd}}$;\quad $t \gets b_{\mathrm{sti}}$
+\Else
+  \State $V \gets D \ll (-lo)$;\quad $r \gets 0$;\quad $t \gets 0$ \Comment{有効ビットが \PB{} 未満：厳密}
+\EndIf
+\If{$r \wedge (t \vee (V \bmod 2))$} \Comment{最近接，タイは偶数へ}
+  \State $V \gets V+1$
+  \If{$V$ が bit $\PB-1$ から桁上がり} \State $V \gets 2^{\PB-1}$;\quad $E_{\mathrm{hi}} \gets E_{\mathrm{hi}}+1$ \EndIf
+\EndIf
+\State $m \gets V \ll \mathit{SB}$;\quad $\code{exp} \gets E_{\mathrm{hi}}+1$;\quad $\code{sign}\gets s$
+\State \Return \code{(sign, exp, m)}
+\end{algorithmic}
+\end{algorithm}
+
+3 つの分岐は，通常ケース，整列ケース，\PB{} 未満ビット（ゆえに厳密）ケースを扱う。
+桁上がり分岐は $1.\overline{1}\!\to\!10.0$ の溢れを指数加算で処理する。
+\code{double} からの変換（\code{from\_double}）と \code{double} への変換
+（\code{to\_double}）も，53 ビット IEEE 仮数上で同じ丸めビット／sticky ビット論理を用いる。
+
+\subsection{乗算}
+\label{sec:freal-mul}
+
+乗算は，レジスタ常駐のスクールブック $O(\Nlimb^2)$ 乗算で\emph{厳密な}
+$2\Nlimb$-limb 積を形成し（図~\ref{fig:mul}），それを \code{finalize} で正規化・丸める。
+\PB{} がコンパイル時定数なので二重ループは完全に展開され，\code{ptxas} は全 limb を
+レジスタに保持する。デバイスでは各 $64\times64\to128$ ステップが
+\code{mad.lo.cc.u64}/\code{madc.hi.u64} の対となり，内積はグローバルメモリ通信なしで走る。
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[x=1mm,y=1mm,font=\small]
+  \draw (0,0) rectangle (50,7); \node at (25,3.5) {$a$：\PB{} bits（$\Nlimb$ limb）};
+  \draw (60,0) rectangle (110,7); \node at (85,3.5) {$b$：\PB{} bits（$\Nlimb$ limb）};
+  \node at (55,3.5) {$\times$};
+  \draw[-{Latex}] (55,-1) -- (55,-6);
+  \draw (5,-22) rectangle (105,-15);
+  \node at (55,-18.5) {厳密積 $a\cdot b$：$2\PB$ bits（$2\Nlimb$ limb）};
+  \draw[dashed] (55,-13) -- (55,-24);
+  \draw[decorate,decoration={brace,amplitude=4pt}] (5,-13) -- (55,-13)
+     node[midway,above=3pt] {上位 \PB{} bits を保持};
+  \draw[decorate,decoration={brace,amplitude=4pt,mirror}] (55,-24) -- (105,-24)
+     node[midway,below=3pt] {下位ビット $\to$ round / sticky};
+\end{tikzpicture}
+\caption{固定精度乗算：厳密な $2\PB$ ビット積をレジスタで計算し，上位 \PB{} ビットを
+保持，残りを \code{finalize} の round/sticky 判定に渡す。結果は $\round(a\cdot b)$，
+すなわち \PB{} ビットの \code{mpfr\_mul} に等しい。}
+\label{fig:mul}
+\end{figure}
+
+\subsection{加算と減算}
+\label{sec:freal-add}
+
+加算は，指数差 $d=e_a-e_b$ により小さい方のオペランドを整列し，limb $0$ より下に
+押し出されたビットを round/sticky として捕捉し，$\Nlimb{+}1$-limb バッファに加算して
+丸める（図~\ref{fig:add}）。同符号の減算は，2 個のガード limb（128 ビット余分）を持つ
+バッファを用いるので，激しい桁落ちでも正しく丸められた結果が残る：厳密差を形成し，
+先頭の非零ビットを見つけ，そこから \code{finalize} が丸める。同符号／異符号の振り分けと
+大きさ比較は MPFR の \code{mpfr\_add}/\code{mpfr\_sub} を踏襲する。
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[x=1mm,y=1mm,font=\small]
+  \draw (0,8) rectangle (60,15); \node at (30,11.5) {$|a|$ 仮数};
+  \draw (18,0) rectangle (78,7);  \node at (48,3.5) {$|b|$ 仮数，$d$ 右シフト};
+  \draw[fill=black!8] (78,0) rectangle (94,7); \node at (86,3.5) {round/sticky};
+  \draw[-{Latex}] (30,-2) -- (30,-7);
+  \draw (0,-18) rectangle (78,-11); \node at (39,-14.5) {和，$\Nlimb{+}1$ limb $\to$ \code{finalize}};
+\end{tikzpicture}
+\caption{固定精度加算：$d=e_a-e_b$ で $|b|$ を整列，押し出しビットを round/sticky として
+保持，加算して一度丸める。減算は桁落ちを吸収する 2 個の余分なガード limb を用いる。}
+\label{fig:add}
+\end{figure}
+
+\subsection{コスト}
+$\Nlimb=\lceil\PB/64\rceil$ として，乗算は $O(\Nlimb^2)$ 語乗算，加減算は
+$O(\Nlimb)$ で，いずれもレジスタ常駐・確保なし。スクールブック乗算は GMP/MPFR の
+劣 2 次乗算より漸近的に劣るので，固定精度の優位は低・中精度（limb をレジスタに保つ
+ことが支配的）で最大となり，高 \PB{} で作業集合がレジスタから溢れると縮む。
+
+
+\section{固定精度複素数型 \texorpdfstring{\code{cu\_fcomplex<\PB>}}{cu\_fcomplex<PB>}}
+\label{sec:fcomplex}
+
+\code{cu\_fcomplex<\PB>}（ヘッダ \code{cu\_fcomplex.cuh}）は \code{cu\_freal<\PB>}
+成分の対である。加減算は成分ごとの \code{cu\_fadd}/\code{cu\_fsub} なので自明に
+\code{MPC\_RNDNN}。興味深いのは乗算で，二重丸めを避けることで\emph{成分ごとに正しく
+丸められる}---MPC の \code{MPC\_RNDNN} とビット一致する。
+
+\subsection{厳密融合 \texorpdfstring{$\fmms$/$\fmma$}{fmms/fmma}}
+\label{sec:fmms}
+
+素朴な複素積 $\Re = ar\,br - ai\,bi$，$\Im = ar\,bi + ai\,br$ は，4 つの実積を減算／加算
+の前にそれぞれ丸めるため，成分あたり 2 回丸めが入り MPC と一致しない。代わりに
+\code{mpc\_cuda} は各成分を融合プリミティブ
+\begin{align}
+\fmms(a,b,c,d) &= \round(a\,b - c\,d), &
+\fmma(a,b,c,d) &= \round(a\,b + c\,d),
+\end{align}
+で評価する。各々は 2 つの\emph{厳密な} $2\Nlimb$-limb 積を\emph{単一}の \rndn{} 丸めで
+合成する（図~\ref{fig:fmms}）。具体的には各積 $a\,b$ と $c\,d$ を \S\ref{sec:freal-mul}
+のスクールブック乗算で厳密に形成し，符号付き広項
+$\code{(sign},\code{exp},M[2\Nlimb])$ に正規化する。次にこの 2 つの広項を指数差で整列
+（3 個のガード limb 付き）して厳密に加減算し，\code{finalize} で一度だけ丸める。
+よって結果は中間丸めなしの $\round(ab\pm cd)$ に等しく，これはまさに MPFR の
+\code{mpfr\_fmms}/\code{mpfr\_fmma}（ひいては MPC）が計算するものである。
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[x=1mm,y=1mm,font=\small]
+  \draw (0,16) rectangle (70,23);  \node at (35,19.5) {厳密 $a\cdot b$：$2\PB$ bits};
+  \draw (10,6) rectangle (80,13);  \node at (45,9.5) {厳密 $c\cdot d$：$2\PB$ bits（指数差で整列）};
+  \node at (-6,11) {$\pm$};
+  \draw[-{Latex}] (40,4) -- (40,-1);
+  \draw (5,-12) rectangle (75,-5); \node at (40,-8.5) {厳密 $ab\pm cd$};
+  \draw[-{Latex}] (40,-13) -- (40,-18);
+  \node[draw,rounded corners] at (40,-22) {単一 \rndn{} 丸め（\code{finalize}）$\Rightarrow \round(ab\pm cd)$};
+\end{tikzpicture}
+\caption{厳密融合 $\fmms/\fmma$：両 $2\PB$ ビット積を厳密に保ち，整列・合成し，
+\emph{一度だけ}丸める。二重丸めがないので，各成分は MPC の \code{MPC\_RNDNN} と
+ビット一致する。}
+\label{fig:fmms}
+\end{figure}
+
+\subsection{複素乗算}
+融合プリミティブを使うと，複素乗算は成分厳密で評価された教科書的恒等式となる：
+\begin{equation}
+(ar+i\,ai)(br+i\,bi) \;=\; \underbrace{\fmms(ar,br,ai,bi)}_{\Re=\round(ar\,br-ai\,bi)}
+\;+\; i\,\underbrace{\fmma(ar,bi,ai,br)}_{\Im=\round(ar\,bi+ai\,br)} .
+\end{equation}
+これは「$3M$ 不使用」の精度優先の定式化であり，4 つの厳密積と 2 つの単一丸め合成からなる。
+$\PB=32\ldots2048$ にわたり MPC とビット一致を検証済みである。
+
+
+\section{固定精度初等関数}
+\label{sec:elem}
+
+初等関数（実数はヘッダ \code{cu\_fmath.cuh}，複素数は \code{cu\_fcmath.cuh}）は，
+正しい丸めをレジスタ常駐性と引き換えにする。各関数は\emph{作業精度}
+\begin{equation}
+W \;=\; \PB + g, \qquad g = \texttt{CU\_FGUARD} = 128~\text{bits（既定）},
+\end{equation}
+で，\code{cu\_freal<$W$>} 上の Newton 反復と引数簡約級数により評価し，$W$ ビット結果を
+\PB{} へ丸め直す。結果はおよそ \PB{} ビットに\emph{忠実}で，一般的な範囲で MPFR/MPC と
+$\lesssim 1\,\ulp$ 一致する。これらは意図的に\emph{正しく丸められない}：テーブルメーカー
+のジレンマには無制限の Ziv ループが必要で，固定レジスタ予算と相容れない。最後の 1
+ビットまでの正しさが必要なら，実行時 \code{cu\_mpfr}/\code{cu\_mpc} API を用いる。
+
+\subsection{Newton カーネル（除算・平方根・立方根）}
+各代数関数は \code{double} 近似で初期化した自己修正 Newton 写像を反復する。反復回数は
+$\lceil\log_2(W/52)\rceil+1$ で，各ステップごとに正しい桁数が倍化する
+（表~\ref{tab:newton}）。
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}llll@{}}
+\toprule
+関数 & 量 & Newton 更新 & 復元\\
+\midrule
+\code{cu\_fdiv}  & 逆数 $z\!\approx\!1/m$ & $z \leftarrow z\,(2 - m z)$ & $a/b = a\cdot(1/b)$\\
+\code{cu\_sqrt}  & rsqrt $y\!\approx\!1/\sqrt m$ & $y \leftarrow \tfrac{1}{2}\,y\,(3 - m y^2)$ & $\sqrt m = m\cdot y$\\
+\code{cu\_cbrt}  & rcbrt $y\!\approx\!m^{-1/3}$ & $y \leftarrow y\,(4 - m y^3)/3$ & $\sqrt[3]{m}=m\,y^2$\\
+\bottomrule
+\end{tabular}
+\caption{固定精度代数関数が用いる除算なし Newton 反復。$m$ は 2 進スケーリングで
+固定区間に収めた仮数で，2 のべきは後で付け直す。}
+\label{tab:newton}
+\end{table}
+
+逆数反復は乗算と減算のみ（除算なし）を用いる。これが \code{cu\_fdiv} すらハードウェア
+除算を避ける理由である。\code{cu\_div\_ui}（小さな $<2^{32}$ 整数による除算）は，級数内
+で用いる別個の正しく丸められる limb 単位ルーチンである。
+
+\subsection{超越関数：引数簡約と級数}
+超越関数は引数を小区間へ簡約し，Taylor（あるいは \code{atanh}/\code{atan}）級数を
+項が作業精度の閾値を下回るまで加算し，復元する。方式を表~\ref{tab:trans} にまとめる。
+定数 $\ln 2$ と $\pi$ 自体も作業精度で，$2\,\operatorname{atanh}(1/3)$ と Machin の
+$16\arctan(1/5)-4\arctan(1/239)$ により計算する。
+
+\begin{table}[h]
+\centering
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}lp{0.44\linewidth}p{0.30\linewidth}@{}}
+\toprule
+関数 & 簡約 & 級数／復元\\
+\midrule
+\code{cu\_exp} & $x = k\ln 2 + r$，$k=\lfloor x/\ln2\rceil$；$r\!\to\!r/2^{m}$ と半減 & $\exp(r)=\sum r^n/n!$，$m$ 回 2 乗，$2^{k}$ 倍\\
+\code{cu\_log} & $x=2^{e}m$，$m\in[\tfrac{1}{\sqrt2},\sqrt2)$；\ $t=\frac{m-1}{m+1}$ & $\log m = 2\operatorname{atanh}(t)$，$e\ln2$ を加算\\
+\code{cu\_sin/cos} & $x=k\frac{\pi}{2}+r$，$|r|\le\frac{\pi}{4}$；$r$ を半減 & $\sin r,\cos r$ の Taylor，倍角で復元，$k\bmod4$ で象限選択\\
+\code{cu\_atan} & $1/x$ で $|x|\le1$ に簡約；$a\leftarrow a/(1+\sqrt{1+a^2})$ & $\arctan$ 級数，$2^{\text{(簡約回数)}}$ 倍\\
+\code{cu\_asin/acos} & $\arcsin x=\arctan\!\big(x/\sqrt{1-x^2}\big)$；$\arccos = \pi/2-\arcsin$ & \code{cu\_atan} 経由\\
+\code{cu\_sinh/cosh} & $e^{x}$ 経由（$\sinh$ は小 $x$ で Taylor） & $\tfrac12(e^x\mp e^{-x})$\\
+\code{cu\_atanh} & $|x|\le\tfrac12$ は級数；他は $\tfrac12\log\frac{1+x}{1-x}$ & \code{atanh} 級数／\code{cu\_log}\\
+\code{cu\_pow} & $x^y=\exp(y\log x)$（$x>0$）；$x<0$ は整数 $y$ 分岐 & \code{cu\_exp}，\code{cu\_log} 経由\\
+\bottomrule
+\end{tabular}
+\caption{固定精度超越関数の引数簡約と復元。全中間値は $W=\PB+128$ の
+\code{cu\_freal<$W$>}。}
+\label{tab:trans}
+\end{table}
+
+\subsection{複素初等関数}
+複素層（\code{cu\_fcmath.cuh}：\code{cu\_cexp}，\code{cu\_clog}，\code{cu\_csqrt}，
+\code{cu\_csin}，\code{cu\_ccos}，\code{cu\_ctan}，\code{cu\_csinh}，\code{cu\_ccosh}，
+\code{cu\_cdiv}，および \code{atan2}）は，実数関数に加え，すべての絶対値 2 乗と交差項に
+\S\ref{sec:fmms} の\emph{厳密}な $\fmms/\fmma$ を用いて構築する。例えば
+\begin{align}
+|z|^2 &= \fmma(\Re z,\Re z,\Im z,\Im z), &
+\log z &= \tfrac12\log|z|^2 + i\,\operatorname{atan2}(\Im z,\Re z),\\
+e^{z} &= e^{\Re z}\,(\cos\Im z + i\sin\Im z), &
+\tfrac{a}{b} &= \frac{\fmma(ar,br,ai,bi) + i\,\fmms(ai,br,ar,bi)}{\fmma(br,br,bi,bi)} .
+\end{align}
+$|b|^2$ と分子に厳密融合積を用いることで，複素除算と絶対値が二重丸めで精度を失うのを
+防ぐ。実数版と同様，これらも忠実で MPC に対し $\lesssim 1\,\ulp$ である。
+
+
+\section{精度と検証}
+\label{sec:accuracy}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}p{0.34\linewidth}p{0.30\linewidth}p{0.28\linewidth}@{}}
+\toprule
+演算 & 保証 & 検証範囲\\
+\midrule
+実行時 \code{cu\_mpfr}/\code{cu\_mpc}（\code{cu\_mpfr\_div} 含む） & 全モードで正しく丸め；ホストとビット一致 & ホスト MPFR/MPC と一致\\
+\code{cu\_freal} $+,-,\times$ & MPFR \rndn{} とビット一致 & $\PB=32\ldots2048$\\
+\code{cu\_fcomplex} $+,-,\times$ & \code{MPC\_RNDNN} とビット一致 & $\PB=32\ldots2048$\\
+\code{cu\_fmath}/\code{cu\_fcmath} & 忠実，$\lesssim 1\,\ulp$（正しく丸めない） & $\PB=64\ldots1024$\\
+\bottomrule
+\end{tabular}
+\caption{演算ごとの精度契約と検証済み精度範囲。}
+\label{tab:accuracy}
+\end{table}
+
+基本算術の 2 つの主張はシステム MPFR・MPC とビット単位で照合し，初等関数の主張は
+MPFR/MPC に対し \ulp{} 単位で照合する（同梱スイートは標本入力で $0\,\ulp$ を報告し，
+設計上の上界は $\le 1\,\ulp$）。契約を表~\ref{tab:accuracy} にまとめる。
+
+
+\section{引用方法}
+\label{sec:cite}
+
+本稿は \code{mpc\_cuda} のアルゴリズムを記述する。引用される可能性が最も高い結果は，
+(i) 単一の丸め点と厳密融合 $\fmms/\fmma$ により MPFR \rndn{} と MPC \code{MPC\_RNDNN}
+にビット一致する，レジスタ常駐の固定精度算術（\S\ref{sec:freal}--\ref{sec:fcomplex}），
+および (ii) デバイス上で MPFR の汎用パスを置き換える \code{mpz} ベースの正しく
+丸められる除算（\S\ref{sec:div}），の 2 つである。性能評価（GPU/CPU クロスオーバーや，
+1024 ビット AXPY における \code{cu\_freal} の実行時 GPU パスに対する
+$\sim\!140\times$ 高速化など）は付属の技術報告（\code{mpc\_cuda\_report}）に与える。
+実行時層の正しく丸める意味論は MPFR \cite{MPFR} と MPC \cite{MPC} に従い，これらは
+GMP \cite{GMP} の上に構築される。基礎となる手法は標準的である
+\cite{BrentZimmermann,Muller}。
+
+\begin{thebibliography}{9}
+\bibitem{GMP} T.~Granlund and the GMP development team,
+  \emph{GNU MP: The GNU Multiple Precision Arithmetic Library}.
+  \url{https://gmplib.org/}.
+\bibitem{MPFR} L.~Fousse, G.~Hanrot, V.~Lef\`evre, P.~P\'elissier, P.~Zimmermann,
+  ``MPFR: A multiple-precision binary floating-point library with correct
+  rounding,'' \emph{ACM Trans.\ Math.\ Softw.}, 33(2), 2007.
+  \url{https://www.mpfr.org/}.
+\bibitem{MPC} A.~Enge, M.~Gastineau, P.~Th\'eveny, P.~Zimmermann,
+  \emph{GNU MPC: A library for multiprecision complex arithmetic with exact
+  rounding}. \url{https://www.multiprecision.org/mpc/}.
+\bibitem{HarveyZimmermann} D.~Harvey and P.~Zimmermann,
+  ``Short Division of Long Integers,''
+  \emph{Proc.\ 20th IEEE Symp.\ on Computer Arithmetic (ARITH-20)}, 2011,
+  pp.~7--14.
+\bibitem{MollerGranlund} N.~M\"oller and T.~Granlund,
+  ``Improved Division by Invariant Integers,''
+  \emph{IEEE Trans.\ Computers}, 60(2):165--175, 2011.
+\bibitem{BrentZimmermann} R.~P.~Brent and P.~Zimmermann,
+  \emph{Modern Computer Arithmetic}, Cambridge University Press, 2010.
+\bibitem{Muller} J.-M.~Muller et al.,
+  \emph{Handbook of Floating-Point Arithmetic}, 2nd ed., Birkh\"auser, 2018.
+\end{thebibliography}
+
+\end{document}

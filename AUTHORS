@@ -1,0 +1,23 @@
+mpc_cuda -- authors and credits
+================================
+
+mpc_cuda is a CUDA port of the GNU multiple-precision stack so that
+arbitrary-precision integer (mini-gmp), correctly-rounded floating-point (MPFR)
+and complex (MPC) arithmetic run inside CUDA kernels.
+
+Maintainer
+----------
+Tomonori Kouya  <tkouya@gmail.com>
+
+Upstream libraries (transformed, not forked)
+--------------------------------------------
+mpc_cuda mechanically adapts pristine upstream sources with the transform
+scripts in tools/.  Full credit for the multiple-precision arithmetic itself
+belongs to the upstream projects:
+
+  * GNU MP (mini-gmp)   https://gmplib.org/        -- the GMP developers
+  * GNU MPFR            https://www.mpfr.org/      -- the MPFR team
+  * GNU MPC             https://www.multiprecision.org/mpc/ -- A. Enge,
+                                          M. Gastineau, P. Theveny, P. Zimmermann
+
+See COPYING.LESSER and COPYING for the license terms.

@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# mpc_cuda-link -- compile and link a CUDA program against an installed mpc_cuda.
+#
+#   mpc_cuda-link <program.cu> <out-binary> [extra link args...]
+#
+# Compiles <program.cu> (which calls the cu_mpfr_*/cu_mpc_*/cu_mpz_* API) and
+# device-links it against the installed static library libmpc_cuda.a.  nvlink
+# pulls exactly the device objects the program's kernels need out of the
+# archive.  (The installed libmpc_cuda.so is host-only -- nvlink cannot read
+# device code from a shared object -- so device-linked programs use the .a.)
+# Paths are baked in by 'make install'.  Override the GPU arch with
+# CUDA_ARCH=sm_XX and add link inputs (e.g. a CPU object plus -lmpfr) as extra
+# arguments or via EXTRA_LINK.
+set -u
+
+NVCC="${NVCC:-@CULINK_NVCC@}"
+ARCH="${CUDA_ARCH:-@CULINK_ARCH@}"
+INCDIR="@INCDIR@"      # .../include/mpc_cuda
+LIBDIR="@LIBDIR@"      # .../lib
+DATADIR="@DATADIR@"    # .../share/mpc_cuda
+BASEINC="$(dirname "$INCDIR")"
+LIB="$LIBDIR/libmpc_cuda.a"
+
+if [ $# -lt 2 ]; then
+  echo "usage: mpc_cuda-link <program.cu> <out-binary> [extra link args...]" >&2; exit 2
+fi
+SRC="$1"; OUT="$2"; shift 2
+EXTRA_LINK="${EXTRA_LINK:-} $*"
+
+[ -f "$LIB" ] || { echo "mpc_cuda-link: $LIB not found (is mpc_cuda installed?)" >&2; exit 1; }
+
+SUP="-diag-suppress 20011,20040 -fmad=false"
+
+# Two ways to use mpc_cuda:
+#  (a) the single umbrella header  #include "mpc_cuda.cuh"  -- fully cu_-namespaced,
+#      coexists with the system <mpfr.h>/<mpc.h>.  Needs ONLY -I<include root> and
+#      NO -D flags; must NOT put the library's mpfr/ mpc/ dirs on the search path
+#      (they would shadow the system <mpfr.h>/<mpc.h>).
+#  (b) the legacy headers  #include "mpfr.h"/"mpc.h" + "mpc_cuda/cu_compat.h"  --
+#      needs the per-library include dirs and the build -D flags.
+if grep -qE '#[[:space:]]*include[[:space:]]*[<"]mpc_cuda\.(cuh|h)[>"]' "$SRC"; then
+  DEFS=""
+  INC="-I$BASEINC"
+else
+  DEFS="$(grep '^-D' "$DATADIR/mpfr_cuda_defs.txt" | tr '\n' ' ')"
+  INC="-I$BASEINC -I$INCDIR/mpfr -I$INCDIR/mpc"
+fi
+
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+
+$NVCC -x cu -dc -arch=$ARCH $DEFS $INC $SUP "$SRC" -o "$TMP/_prog.o" || exit 1
+
+if $NVCC -arch=$ARCH -rdc=true $SUP "$TMP/_prog.o" "$LIB" $EXTRA_LINK -o "$OUT"; then
+  echo "linked $OUT against $LIB"; exit 0
+fi
+echo "mpc_cuda-link: link failed (a function used by $SRC may not be provided by libmpc_cuda)" >&2
+exit 1

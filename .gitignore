@@ -1,0 +1,19 @@
+# build products
+/build/
+
+# autoconf / configure outputs
+/configure
+/Makefile
+/mpc_cuda.pc
+/config.log
+/config.status
+/autom4te.cache/
+/aclocal.m4
+
+# editor / OS cruft
+*.o
+*~
+.DS_Store
+
+# distribution tarballs
+/mpc_cuda-*.tar.*

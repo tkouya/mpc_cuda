@@ -1,0 +1,25 @@
+\contentsline {section}{\numberline {1}Introduction}{2}{section.1}%
+\contentsline {section}{\numberline {2}Overall Design and Construction Procedure}{2}{section.2}%
+\contentsline {subsection}{\numberline {2.1}The upstream sources}{2}{subsection.2.1}%
+\contentsline {subsection}{\numberline {2.2}The transform-script approach}{3}{subsection.2.2}%
+\contentsline {subsection}{\numberline {2.3}The layered phases}{3}{subsection.2.3}%
+\contentsline {section}{\numberline {3}Implementation Difficulties and Solutions}{4}{section.3}%
+\contentsline {subsection}{\numberline {3.1}Making it compile}{4}{subsection.3.1}%
+\contentsline {subsection}{\numberline {3.2}Making it run correctly on the device}{4}{subsection.3.2}%
+\contentsline {subsection}{\numberline {3.3}The hardest problem: device miscompile of \texttt {mpfr\_div}}{5}{subsection.3.3}%
+\contentsline {subsection}{\numberline {3.4}Stack, arena, and parallelism}{5}{subsection.3.4}%
+\contentsline {subsection}{\numberline {3.5}Coexistence: the cu\_ namespace and the umbrella header}{6}{subsection.3.5}%
+\contentsline {subsection}{\numberline {3.6}Other bugs and lessons}{6}{subsection.3.6}%
+\contentsline {section}{\numberline {4}The Compile-Time Fixed-Precision Fast Path}{6}{section.4}%
+\contentsline {subsection}{\numberline {4.1}Design}{7}{subsection.4.1}%
+\contentsline {subsection}{\numberline {4.2}Elementary functions}{7}{subsection.4.2}%
+\contentsline {section}{\numberline {5}Performance Evaluation}{7}{section.5}%
+\contentsline {subsection}{\numberline {5.1}AXPY (real and complex)}{8}{subsection.5.1}%
+\contentsline {subsection}{\numberline {5.2}Basic linear algebra (matrix-vector and matrix multiply)}{8}{subsection.5.2}%
+\contentsline {subsection}{\numberline {5.3}Elementary functions}{8}{subsection.5.3}%
+\contentsline {subsection}{\numberline {5.4}The fixed-precision fast path and a precision sweep}{10}{subsection.5.4}%
+\contentsline {paragraph}{All paths cross (H100).}{11}{section*.2}%
+\contentsline {subsection}{\numberline {5.5}The fixed-precision path on the CPU}{12}{subsection.5.5}%
+\contentsline {subsection}{\numberline {5.6}Discussion}{12}{subsection.5.6}%
+\contentsline {subsection}{\numberline {5.7}Cross-platform comparison: GB10 vs H100 (synthesis)}{13}{subsection.5.7}%
+\contentsline {section}{\numberline {6}Conclusion and Future Work}{16}{section.6}%

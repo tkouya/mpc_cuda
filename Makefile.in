@@ -1,0 +1,383 @@
+# Makefile.in for mpc_cuda -- processed by ./configure into Makefile.
+#
+# The GNU multiple-precision stack (mini-gmp -> MPFR -> MPC) inside CUDA kernels.
+# The library is a set of device-relocatable (-rdc) objects produced from the
+# upstream sources by the transform scripts in tools/; a user program is linked
+# against them by resolving the device link closure (tools/link_program.sh).
+
+PACKAGE      = @PACKAGE_NAME@
+VERSION      = @PACKAGE_VERSION@
+distdir      = $(PACKAGE)-$(VERSION)
+
+# --- tools and target, substituted by configure ----------------------------
+NVCC         = @NVCC@
+CXX          = @CXX@
+PYTHON       = @PYTHON@
+CUDA_ARCH    = @CUDA_ARCH@
+GMP_SRC      = @GMP_SRC@
+MPFR_SRC     = @MPFR_SRC@
+MPC_SRC      = @MPC_SRC@
+HAVE_SYSTEM_MPFR = @HAVE_SYSTEM_MPFR@
+HAVE_SYSTEM_MPC  = @HAVE_SYSTEM_MPC@
+NM           = @NM@
+SHELL        = /bin/sh
+
+# the transform/link scripts read these from the environment
+export NVCC PYTHON CUDA_ARCH GMP_SRC MPFR_SRC MPC_SRC
+
+# --- installation directories ----------------------------------------------
+prefix       = @prefix@
+exec_prefix  = @exec_prefix@
+bindir       = @bindir@
+libdir       = @libdir@
+includedir   = @includedir@
+datarootdir  = @datarootdir@
+datadir      = @datadir@
+docdir       = $(datarootdir)/doc/$(PACKAGE)
+INSTALL      = install -c
+INSTALL_DATA = install -c -m 644
+MKDIR_P      = mkdir -p
+
+pkgincdir    = $(includedir)/mpc_cuda
+pkgdatadir   = $(datadir)/mpc_cuda
+
+BUILD        = build
+STAMP        = $(BUILD)/.lib-stamp
+ARCHSTAMP    = $(BUILD)/.arch-$(CUDA_ARCH)
+
+TESTS = test_minigmp test_mpfr test_mpc test_mpfr_trans
+DEMOS = axpy_mpfr axpy_mpc matvec_mpfr matmul_mpfr matvec_mpc matmul_mpc \
+        elem_bench_mpfr elem_bench_mpc
+
+# The CUDA-adapted sources are committed first-class sources (no upstream
+# GMP/MPFR/MPC needed to build).  The library is rebuilt when any of them, the
+# defs, or the build script change.
+# Inputs to the library build.  Note: only cuda_minigmp.h from include/ is a real
+# build input; the umbrella headers include/mpc_cuda/cu_*.h (and cu_compat.h) are
+# consumed by USER programs, not by build_lib.sh, so they are deliberately NOT
+# listed here -- otherwise regenerating them (make umbrella) would trigger a
+# spurious full library rebuild.
+LIBSRC = $(wildcard src/cuda_minigmp.cu src/mpfr_cuda/*.c src/mpfr_cuda/*.h \
+         src/mpc_cuda/*.c src/mpc_cuda/*.h) include/mpc_cuda/cuda_minigmp.h \
+         tools/mpfr_cuda_defs.txt tools/build_lib.sh
+
+# transform scripts + upstream needed only for the opt-in 'make regen'
+GEN = tools/cudafy_minigmp.py tools/cudafy_mpfr.py tools/cudafy_mpc.py \
+      tools/cu_prefix.py tools/cu_rename_syms.txt
+
+.PHONY: all lib regen umbrella check demos matrix bench coexist cputest cpubench \
+        sample sample-fixed check-fixed check-fmath bench3 doc algorithm figures xlsx clean distclean dist dist-xz dist-gzip distcheck install uninstall installcheck help
+.DEFAULT_GOAL := all
+
+all: lib
+
+# --- the device-object library (built once) --------------------------------
+lib: $(STAMP)
+$(STAMP): $(LIBSRC) $(ARCHSTAMP) | $(BUILD)
+	bash tools/build_lib.sh
+	@touch $(STAMP)
+
+# Records the arch the library objects were built for.  The library objects
+# carry SASS/PTX for one arch only; the test/demo link uses $(CUDA_ARCH).  When
+# CUDA_ARCH changes (reconfigure or 'make CUDA_ARCH=...'), this marker's name
+# changes, so it is missing and gets (re)created newer than $(STAMP) -- which
+# forces a library rebuild for the new arch instead of linking against stale
+# objects ("SM Arch not found" / undefined device symbols).
+$(ARCHSTAMP): | $(BUILD)
+	@rm -f $(BUILD)/.arch-*
+	@touch $@
+
+# --- regenerate the committed CUDA-adapted sources from upstream (opt-in) ---
+# Requires the upstream GMP/MPFR/MPC source trees (GMP_SRC/MPFR_SRC/MPC_SRC).
+regen: $(GEN)
+	GEN=1 bash tools/build_lib.sh
+	$(PYTHON) tools/make_umbrella.py
+	@touch $(STAMP)
+
+# Regenerate ONLY the single-include umbrella headers (include/mpc_cuda/cu_*.h)
+# from the committed cudafied public headers.  No upstream needed.
+umbrella:
+	$(PYTHON) tools/make_umbrella.py
+
+$(BUILD):
+	$(MKDIR_P) $(BUILD)
+
+# --- tests ------------------------------------------------------------------
+$(BUILD)/test_%: tests/test_%.cu $(STAMP)
+	bash tools/link_program.sh $< $@
+
+check: lib
+	@fail=0; \
+	for t in $(TESTS); do \
+	  echo "=== building+running $$t ==="; \
+	  bash tools/link_program.sh tests/$$t.cu $(BUILD)/$$t || { fail=1; continue; }; \
+	  ./$(BUILD)/$$t || fail=1; \
+	done; \
+	if test $$fail -eq 0; then echo "ALL TESTS PASSED"; else echo "SOME TESTS FAILED"; exit 1; fi
+
+# --- demos / benchmarks -----------------------------------------------------
+$(BUILD)/%: demos/%.cu $(STAMP)
+	bash tools/link_program.sh $< $@
+
+demos: lib $(addprefix $(BUILD)/,$(DEMOS))
+	@echo "demos built: $(DEMOS)"
+
+matrix: lib $(BUILD)/matvec_mpfr $(BUILD)/matmul_mpfr $(BUILD)/matvec_mpc $(BUILD)/matmul_mpc
+	./$(BUILD)/matvec_mpfr; ./$(BUILD)/matmul_mpfr; ./$(BUILD)/matvec_mpc; ./$(BUILD)/matmul_mpc
+
+bench: lib $(BUILD)/elem_bench_mpfr $(BUILD)/elem_bench_mpc
+	./$(BUILD)/elem_bench_mpfr; ./$(BUILD)/elem_bench_mpc
+
+# coexistence demo: this library (GPU) + the system libmpfr (CPU) in one binary
+coexist: lib demos/coexist_demo.cu demos/coexist_cpu.cpp
+	@if test "$(HAVE_SYSTEM_MPFR)" != yes; then \
+	  echo "system libmpfr/libgmp not found at configure time; 'make coexist' needs them"; exit 1; fi
+	$(CXX) -c $(SYS_MP_INC) demos/coexist_cpu.cpp -o $(BUILD)/coexist_cpu.o
+	EXTRA_LINK="$(BUILD)/coexist_cpu.o $(SYS_MP_LIBS)" \
+	  bash tools/link_program.sh demos/coexist_demo.cu $(BUILD)/coexist_demo
+	./$(BUILD)/coexist_demo
+
+# CPU-reference test + benchmark: link THIS library's GPU port (cu_mpfr_*/
+# cu_mpc_*) and the ordinary CPU libmpfr/libmpc into ONE binary, and check the
+# GPU against the CPU.  Need the system libraries AND their <mpfr.h>/<mpc.h>.
+# The CPU half (demos/cpu_ref.cpp) is compiled with the host C++ compiler and
+# passed to the device link via EXTRA_LINK with -lmpc -lmpfr -lgmp.
+# OMP_CXXFLAGS/OMP_LIBS make the CPU reference run multi-threaded (OpenMP) so the
+# CPU benchmark reflects the FULL machine; libgomp is pulled into the nvcc link.
+OMP_CXXFLAGS ?= -fopenmp
+OMP_LIBS     ?= -lgomp
+$(BUILD)/cpu_ref.o: demos/cpu_ref.cpp demos/cpu_ref.h | $(BUILD)
+	$(CXX) -O2 $(OMP_CXXFLAGS) $(SYS_MP_INC) -c demos/cpu_ref.cpp -o $@
+
+cputest: lib $(BUILD)/cpu_ref.o demos/cputest.cu
+	@if test "$(HAVE_SYSTEM_MPC)" != yes; then \
+	  echo "system libmpfr/libmpc (+ headers) not found at configure time; 'make cputest' needs them"; exit 1; fi
+	EXTRA_LINK="$(BUILD)/cpu_ref.o $(SYS_MP_LIBS) $(OMP_LIBS)" \
+	  bash tools/link_program.sh demos/cputest.cu $(BUILD)/cputest
+	./$(BUILD)/cputest
+
+cpubench: lib $(BUILD)/cpu_ref.o demos/cpubench.cu
+	@if test "$(HAVE_SYSTEM_MPC)" != yes; then \
+	  echo "system libmpfr/libmpc (+ headers) not found at configure time; 'make cpubench' needs them"; exit 1; fi
+	EXTRA_LINK="$(BUILD)/cpu_ref.o $(SYS_MP_LIBS) $(OMP_LIBS)" \
+	  bash tools/link_program.sh demos/cpubench.cu $(BUILD)/cpubench
+	./$(BUILD)/cpubench
+
+# --- "easy to use" sample ---------------------------------------------------
+# demos/sample_easy.cu includes BOTH the system <mpfr.h>/<mpc.h> (CPU) and this
+# library's single umbrella header "mpc_cuda.cuh" (GPU) in ONE .cu file, with no
+# name clashes, and checks the GPU result against the CPU bit-for-bit.
+#
+# Note the *minimal* flags a user needs: -Iinclude for the umbrella header (no
+# -D..., no -Isrc/...), link against libmpc_cuda.a plus the system -lmpc -lmpfr
+# -lgmp.  Defaults come from configure (--with-mp-prefix fills in the include
+# path and the lib path + rpath); both can still be overridden on the command
+# line (e.g. SYS_MP_INC=-I/usr/local/include SYS_MP_LIBS='-L/usr/local/lib ...').
+SYS_MP_INC  ?= @SYS_MP_INC@
+SYS_MP_LIBS ?= @SYS_MP_LIBS@
+sample: lib demos/sample_easy.cu
+	@if test "$(HAVE_SYSTEM_MPC)" != yes; then \
+	  echo "system libmpfr/libmpc (+ headers) not found at configure time; 'make sample' needs them"; exit 1; fi
+	$(NVCC) -x cu -dc -arch=$(CUDA_ARCH) -fmad=false -diag-suppress 20011,20040,550 \
+	    -Iinclude $(SYS_MP_INC) demos/sample_easy.cu -o $(BUILD)/sample_easy.dco.o
+	$(NVCC) -arch=$(CUDA_ARCH) -rdc=true -fmad=false -diag-suppress 20011 \
+	    $(BUILD)/sample_easy.dco.o $(BUILD)/libmpc_cuda.a $(SYS_MP_LIBS) -o $(BUILD)/sample_easy
+	./$(BUILD)/sample_easy
+
+# --- 3-way speed/accuracy comparison: GPU fixed vs GPU runtime vs CPU --------
+# demos/bench_3way.cu pits cu_freal/cu_fcomplex<P> (GPU fixed precision) against
+# cu_mpfr/cu_mpc (GPU runtime+arena) and the system MPFR/MPC (CPU), for AXPY at
+# 128..8192-bit, showing where the fixed-precision fast path stops winning.
+$(BUILD)/bench3_cpu.o: demos/bench3_cpu.cpp | $(BUILD)
+	$(CXX) -O2 $(OMP_CXXFLAGS) $(SYS_MP_INC) -c demos/bench3_cpu.cpp -o $@
+bench3: lib $(BUILD)/bench3_cpu.o demos/bench_3way.cu
+	@if test "$(HAVE_SYSTEM_MPC)" != yes; then \
+	  echo "system libmpfr/libmpc (+ headers) not found at configure time; 'make bench3' needs them"; exit 1; fi
+	EXTRA_LINK="$(BUILD)/bench3_cpu.o $(SYS_MP_LIBS) $(OMP_LIBS)" \
+	  bash tools/link_program.sh demos/bench_3way.cu $(BUILD)/bench_3way
+	./$(BUILD)/bench_3way
+
+# --- fixed-precision fast-path validation (header-only; needs system MPFR) ---
+# Checks cu_freal<PB> mul/add/sub bit-exact vs system MPFR across PB=32..2048
+# (including sub-limb SB=32 precisions).  Needs <mpfr.h>/<gmp.h> + libs.
+check-fixed: tools/test_freal.cu tools/test_fcomplex.cu \
+             include/mpc_cuda/cu_freal.cuh include/mpc_cuda/cu_fcomplex.cuh
+	@if test "$(HAVE_SYSTEM_MPC)" != yes; then \
+	  echo "system libmpfr/libmpc (+ headers) not found at configure time; 'make check-fixed' needs them"; exit 1; fi
+	$(MKDIR_P) $(BUILD)
+	$(NVCC) -arch=$(CUDA_ARCH) -O3 -fmad=false -Iinclude $(SYS_MP_INC) \
+	    tools/test_freal.cu -o $(BUILD)/test_freal $(SYS_MP_LIBS)
+	./$(BUILD)/test_freal
+	$(NVCC) -arch=$(CUDA_ARCH) -O3 -fmad=false -Iinclude $(SYS_MP_INC) \
+	    tools/test_fcomplex.cu -o $(BUILD)/test_fcomplex $(SYS_MP_LIBS)
+	./$(BUILD)/test_fcomplex
+
+# --- fixed-precision elementary-function accuracy check (needs system MPFR/MPC)
+# Reports max ULP error of cu_fp elementary functions vs MPFR/MPC across PB.
+check-fmath: tools/test_fmath.cu tools/test_fmath3.cu tools/test_fcmath.cu \
+             include/mpc_cuda/cu_fmath.cuh include/mpc_cuda/cu_fcmath.cuh
+	@if test "$(HAVE_SYSTEM_MPC)" != yes; then \
+	  echo "system libmpfr/libmpc (+ headers) not found; 'make check-fmath' needs them"; exit 1; fi
+	$(MKDIR_P) $(BUILD)
+	$(NVCC) -arch=$(CUDA_ARCH) -O3 -fmad=false -Iinclude $(SYS_MP_INC) \
+	    tools/test_fmath.cu  -o $(BUILD)/test_fmath  $(SYS_MP_LIBS) && ./$(BUILD)/test_fmath
+	$(NVCC) -arch=$(CUDA_ARCH) -O3 -fmad=false -Iinclude $(SYS_MP_INC) \
+	    tools/test_fmath3.cu -o $(BUILD)/test_fmath3 $(SYS_MP_LIBS) && ./$(BUILD)/test_fmath3
+	$(NVCC) -arch=$(CUDA_ARCH) -O3 -fmad=false -Iinclude $(SYS_MP_INC) \
+	    tools/test_fcmath.cu -o $(BUILD)/test_fcmath $(SYS_MP_LIBS) && ./$(BUILD)/test_fcmath
+
+# --- fixed-precision fast-path sample (header-only, no library link) ---------
+# demos/sample_fixed.cu uses the public cu_fp::cu_freal<PB> template via the
+# umbrella header alone -- no libmpc_cuda link, no -D, just -Iinclude.  PB is a
+# compile-time mantissa width (any multiple of 32).
+sample-fixed: demos/sample_fixed.cu include/mpc_cuda/cu_freal.cuh
+	$(MKDIR_P) $(BUILD)
+	$(NVCC) -arch=$(CUDA_ARCH) -O3 -fmad=false -Iinclude \
+	    demos/sample_fixed.cu -o $(BUILD)/sample_fixed
+	./$(BUILD)/sample_fixed
+
+# --- documentation (TeX reports + figures + benchmark workbook) -------------
+# 'make doc' compiles the bilingual TeX technical reports to PDF with upLaTeX +
+# dvipdfmx (figures doc/figures/*.pdf and the .xlsx are committed, so this needs
+# only a TeX install).  'make figures' / 'make xlsx' REGENERATE the committed
+# artifacts and need a python3 with matplotlib / openpyxl+xlsxwriter.
+UPLATEX  ?= uplatex
+DVIPDFMX ?= dvipdfmx
+doc:
+	@command -v $(UPLATEX) >/dev/null 2>&1 || { echo "need upLaTeX (uplatex); set UPLATEX=..."; exit 1; }
+	-command -v extractbb >/dev/null 2>&1 && extractbb doc/figures/*.pdf
+	cd doc && for d in mpc_cuda_report.ja mpc_cuda_report.en; do \
+	  $(UPLATEX) $$d.tex && $(UPLATEX) $$d.tex && $(DVIPDFMX) $$d || exit 1; done
+	@echo "built doc/mpc_cuda_report.ja.pdf and doc/mpc_cuda_report.en.pdf"
+figures:
+	$(PYTHON) tools/make_figures.py
+xlsx:
+	$(PYTHON) tools/make_benchmark_xlsx.py
+
+# 'make algorithm' builds the algorithm note in both languages: the English
+# doc/algorithm.tex with pdfLaTeX (self-contained TikZ figures, no external
+# files), and the Japanese doc/algorithm.ja.tex with upLaTeX + dvipdfmx (same
+# toolchain as 'make doc').  Run each twice so the table of contents resolves.
+PDFLATEX ?= pdflatex
+algorithm:
+	@command -v $(PDFLATEX) >/dev/null 2>&1 || { echo "need pdfLaTeX (pdflatex); set PDFLATEX=..."; exit 1; }
+	cd doc && $(PDFLATEX) -interaction=nonstopmode -halt-on-error algorithm.tex >/dev/null \
+	       && $(PDFLATEX) -interaction=nonstopmode -halt-on-error algorithm.tex >/dev/null
+	@command -v $(UPLATEX) >/dev/null 2>&1 || { echo "need upLaTeX (uplatex) for the Japanese version; set UPLATEX=..."; exit 1; }
+	cd doc && $(UPLATEX) algorithm.ja.tex && $(UPLATEX) algorithm.ja.tex && $(DVIPDFMX) algorithm.ja
+	cd doc && rm -f algorithm.aux algorithm.log algorithm.out algorithm.toc \
+	               algorithm.ja.aux algorithm.ja.log algorithm.ja.out algorithm.ja.toc algorithm.ja.dvi
+	@echo "built doc/algorithm.pdf (English) and doc/algorithm.ja.pdf (Japanese)"
+
+# --- installation -----------------------------------------------------------
+# Installs the headers (three include roots), the single static + shared
+# library (libmpc_cuda.a / libmpc_cuda.so), the defs file, a generated
+# 'mpc_cuda-link' helper, and the pkg-config file.
+install: lib mpc_cuda.pc
+	$(MKDIR_P) $(DESTDIR)$(pkgincdir)/mpfr $(DESTDIR)$(pkgincdir)/mpc
+	$(INSTALL_DATA) include/mpc_cuda/*.h $(DESTDIR)$(pkgincdir)/
+	$(INSTALL_DATA) include/mpc_cuda/cu_freal.cuh include/mpc_cuda/cu_fcomplex.cuh \
+	    include/mpc_cuda/cu_fmath.cuh include/mpc_cuda/cu_fcmath.cuh $(DESTDIR)$(pkgincdir)/
+	$(MKDIR_P) $(DESTDIR)$(includedir)
+	$(INSTALL_DATA) include/mpc_cuda.cuh include/mpc_cuda.h $(DESTDIR)$(includedir)/
+	cd src/mpfr_cuda && find . -name '*.h' -print | tar -cf - -T - | tar -xf - -C $(DESTDIR)$(pkgincdir)/mpfr
+	cd src/mpc_cuda  && find . -name '*.h' -print | tar -cf - -T - | tar -xf - -C $(DESTDIR)$(pkgincdir)/mpc
+	$(MKDIR_P) $(DESTDIR)$(libdir)
+	$(INSTALL_DATA) $(BUILD)/libmpc_cuda.a $(DESTDIR)$(libdir)/
+	test -f $(BUILD)/libmpc_cuda.so && $(INSTALL_DATA) $(BUILD)/libmpc_cuda.so $(DESTDIR)$(libdir)/ || true
+	$(MKDIR_P) $(DESTDIR)$(pkgdatadir)
+	$(INSTALL_DATA) tools/mpfr_cuda_defs.txt $(DESTDIR)$(pkgdatadir)/
+	$(MKDIR_P) $(DESTDIR)$(libdir)/pkgconfig
+	$(INSTALL_DATA) mpc_cuda.pc $(DESTDIR)$(libdir)/pkgconfig/
+	$(MKDIR_P) $(DESTDIR)$(docdir)
+	$(INSTALL_DATA) README.md NEWS doc/manual.md $(DESTDIR)$(docdir)/
+	$(MKDIR_P) $(DESTDIR)$(bindir)
+	sed -e 's|@CULINK_NVCC@|$(NVCC)|g' -e 's|@CULINK_ARCH@|$(CUDA_ARCH)|g' \
+	    -e 's|@INCDIR@|$(pkgincdir)|g' -e 's|@LIBDIR@|$(libdir)|g' \
+	    -e 's|@DATADIR@|$(pkgdatadir)|g' \
+	    tools/mpc_cuda-link.in > $(DESTDIR)$(bindir)/mpc_cuda-link
+	chmod +x $(DESTDIR)$(bindir)/mpc_cuda-link
+	@echo "mpc_cuda $(VERSION) installed under $(prefix)"
+
+installcheck:
+	@command -v $(DESTDIR)$(bindir)/mpc_cuda-link >/dev/null 2>&1 || \
+	  { echo "mpc_cuda-link not installed"; exit 1; }
+	@test -f $(DESTDIR)$(libdir)/libmpc_cuda.a || \
+	  { echo "libmpc_cuda.a not installed"; exit 1; }
+	@echo "installcheck: libmpc_cuda + mpc_cuda-link present"
+
+uninstall:
+	rm -rf $(DESTDIR)$(pkgincdir) $(DESTDIR)$(pkgdatadir) $(DESTDIR)$(docdir)
+	rm -f $(DESTDIR)$(libdir)/libmpc_cuda.a $(DESTDIR)$(libdir)/libmpc_cuda.so \
+	      $(DESTDIR)$(libdir)/pkgconfig/mpc_cuda.pc $(DESTDIR)$(bindir)/mpc_cuda-link
+
+# --- distribution tarball ---------------------------------------------------
+# The CUDA-adapted source trees (src/, include/) are shipped; the upstream
+# GMP/MPFR/MPC trees are NOT required to build and are intentionally omitted.
+DISTFILES = configure.ac configure Makefile.in mpc_cuda.pc.in \
+            README.md NEWS ChangeLog AUTHORS COPYING COPYING.LESSER .gitignore \
+            tools demos tests doc include src
+# 'make dist' builds an xz tarball by default; 'make dist-gzip' for .tar.gz.
+dist: dist-xz
+dist-xz: $(distdir)
+	tar cJf $(distdir).tar.xz $(distdir)
+	rm -rf $(distdir)
+	@echo "created $(distdir).tar.xz"
+dist-gzip: $(distdir)
+	tar czf $(distdir).tar.gz $(distdir)
+	rm -rf $(distdir)
+	@echo "created $(distdir).tar.gz"
+$(distdir):
+	rm -rf $(distdir)
+	$(MKDIR_P) $(distdir)
+	cp -r $(DISTFILES) $(distdir)/ 2>/dev/null || true
+	find $(distdir) -name '*.o' -delete
+	find $(distdir)/doc \( -name '*.aux' -o -name '*.dvi' -o -name '*.log' \
+	     -o -name '*.out' -o -name '*.toc' \) -delete
+
+# 'make distcheck' self-tests the tarball: build it, unpack into a fresh tree,
+# then configure + make (library) + make algorithm (docs) from that pristine
+# copy.  A clean pass proves the tarball is self-contained and complete.  Needs
+# the full toolchain (nvcc + pdfLaTeX/upLaTeX), like any real build.
+distcheck: dist-xz
+	rm -rf _distcheck
+	$(MKDIR_P) _distcheck
+	tar xJf $(distdir).tar.xz -C _distcheck
+	cd _distcheck/$(distdir) && ./configure && $(MAKE) && $(MAKE) algorithm
+	rm -rf _distcheck
+	@echo "distcheck: $(distdir).tar.xz configures, builds, and documents cleanly"
+
+# --- cleaning ---------------------------------------------------------------
+# Removes only build products.  The committed CUDA-adapted sources (src/, the
+# cuda_minigmp header) are kept; regenerate them explicitly with 'make regen'.
+clean:
+	rm -rf $(BUILD)
+
+distclean: clean
+	rm -f Makefile mpc_cuda.pc config.log config.status
+	rm -rf autom4te.cache
+
+help:
+	@echo "mpc_cuda $(VERSION) -- make targets:"
+	@echo "  make            build the device-object library (no upstream needed)"
+	@echo "  make regen      regenerate the CUDA-adapted sources from upstream"
+	@echo "  make check      build and run the test suite"
+	@echo "  make umbrella   (re)generate the single-include cu_*.h headers"
+	@echo "  make sample     build+run the one-file GPU+CPU coexistence sample"
+	@echo "  make sample-fixed  build+run the fixed-precision cu_freal<PB> sample"
+	@echo "  make check-fixed   validate cu_freal/cu_fcomplex bit-exact vs system MPFR/MPC"
+	@echo "  make check-fmath   ULP accuracy of cu_fp elementary functions vs MPFR/MPC"
+	@echo "  make bench3        3-way GPU-fixed vs GPU-runtime vs CPU AXPY, 128..8192-bit"
+	@echo "  make doc           build the bilingual TeX reports -> doc/*.pdf (needs upLaTeX+dvipdfmx)"
+	@echo "  make algorithm     build the algorithm note -> doc/algorithm.pdf (EN, pdfLaTeX) + doc/algorithm.ja.pdf (JA, upLaTeX)"
+	@echo "  make figures/xlsx  regenerate doc figures / benchmark .xlsx (needs python3 matplotlib/xlsxwriter)"
+	@echo "  make demos      build all AXPY / matrix / benchmark demos"
+	@echo "  make matrix     build+run the matrix-vector / matrix-matrix demos"
+	@echo "  make bench      build+run the elementary-function benchmarks"
+	@echo "  make coexist    build+run cu_mpfr (GPU) + system libmpfr (CPU) demo"
+	@echo "  make cputest    build+run GPU-vs-system-libmpfr/libmpc correctness test"
+	@echo "  make cpubench   build+run GPU-vs-system-libmpfr/libmpc benchmark"
+	@echo "  make install    install headers, objects, mpc_cuda-link, mpc_cuda.pc"
+	@echo "  make dist       create $(distdir).tar.xz  (dist-gzip for .tar.gz)"
+	@echo "  make distcheck  build the tarball, then configure+make+make algorithm from a fresh unpack"
+	@echo "  make clean / distclean"

@@ -1,0 +1,33 @@
+prefix=@prefix@
+exec_prefix=@exec_prefix@
+includedir=@includedir@
+libdir=@libdir@
+
+datadir=@datarootdir@/mpc_cuda
+cuda_arch=@CUDA_ARCH@
+
+Name: mpc_cuda
+Description: GNU multiple-precision stack (mini-gmp/MPFR/MPC) inside CUDA kernels, cu_ namespace
+Version: @PACKAGE_VERSION@
+URL: https://github.com/tkouya/mpc_cuda
+# Recommended usage is the single umbrella header  #include "mpc_cuda.cuh"  --
+# fully cu_-namespaced, so it coexists with the system <gmp.h>/<mpfr.h>/<mpc.h>.
+# For that, ONLY the include root is needed.  We deliberately do NOT put the
+# library's own mpfr/ and mpc/ dirs on the default search path here: they contain
+# headers literally named mpfr.h / mpc.h and would shadow the system ones.
+Cflags: -I${includedir}
+# Legacy usage (including the library's own "mpfr.h"/"mpc.h" + "mpc_cuda/cu_compat.h"
+# instead of the umbrella) additionally needs these, plus the build -D flags from
+# ${datadir}/mpfr_cuda_defs.txt.  Fetch with:  pkg-config --variable=legacy_cflags mpc_cuda
+legacy_cflags=-I${includedir}/mpc_cuda/mpfr -I${includedir}/mpc_cuda/mpc
+# libmpc_cuda is device-relocatable code: a device-linked CUDA executable must
+# link the STATIC archive, since nvlink cannot pull device code out of a .so.
+# `Libs` below (-lmpc_cuda) would resolve to the .so when both are installed, so
+# for a -rdc=true device link pass the archive explicitly instead -- e.g.
+#   nvcc -rdc=true ... $(pkg-config --variable=archive mpc_cuda) $(pkg-config --libs-only-L mpc_cuda)
+# or just use the 'mpc_cuda-link' helper, which sets up the -dc compile and -rdc
+# device link for you.  The shared libmpc_cuda.so exposes the host-callable cu_*
+# API for host-only consumers.
+archive=${libdir}/libmpc_cuda.a
+Libs: -L${libdir} -lmpc_cuda
+Libs.private: -lcudart

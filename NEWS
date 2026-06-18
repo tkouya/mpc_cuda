@@ -1,0 +1,40 @@
+mpc_cuda NEWS -- user-visible changes
+=====================================
+
+Version 0.0.1 (initial release)
+-------------------------------
+
+First public release.  mpc_cuda runs the GNU multiple-precision stack
+(mini-gmp -> MPFR -> MPC) inside CUDA kernels.
+
+Highlights:
+
+  * mini-gmp (integer), a faithful device port of MPFR 4.2.2 (correctly-rounded
+    real), and MPC 1.4.1 (complex) all run on the GPU and match the host
+    bit-for-bit on every tested operation.
+
+  * Transcendental / elementary functions on the device: exp, log, sin, cos,
+    tan, atan, sinh, cosh, sqrt, cbrt, ... and the complex MPC counterparts.
+    (A device-correct mpz-based mpfr_div replaces MPFR's generic division path,
+    which miscompiles under nvcc; see doc/manual.md.)
+
+  * cu_ symbol namespace: every exported symbol is prefixed (cu_mpfr_*,
+    cu_mpc_*, cu_mpn_*/cu_mpz_*) so the library coexists with the system
+    libgmp/libmpfr/libmpc in a single binary.
+
+  * Per-thread bump arena + grid-stride launch give large GPU-vs-CPU speedups
+    while staying bit-exact.
+
+  * Demos and benchmarks: AXPY, matrix-vector and matrix-matrix products, and
+    elementary/transcendental function benchmarks, for both MPFR and MPC, each
+    comparing GPU vs CPU time and accuracy.
+
+Build system: autoconf-based.  ./configure && make && make check.
+
+Known limitations (see doc/manual.md, "Limitations"):
+
+  * The exponent-range / flags state is shared across threads; results match the
+    host within 1e-13 up to the tested thread counts, but a fully race-free
+    per-thread state is future work.
+
+  * I/O routines (mpfr_printf, *_str parsing) are host-only.

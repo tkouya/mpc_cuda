@@ -1,0 +1,14 @@
+2026-06-05  Tomonori Kouya  <tkouya@gmail.com>
+
+	Release 0.0.1.
+
+	* Initial public release of mpc_cuda: the GNU multiple-precision stack
+	  (mini-gmp -> MPFR 4.2.2 -> MPC 1.4.1) running inside CUDA kernels,
+	  produced by re-runnable transform scripts (tools/cudafy_*.py).
+	* cu_ symbol namespace (tools/cu_prefix.py) for coexistence with the
+	  system libgmp/libmpfr/libmpc.
+	* Device-correct mpz-based mpfr_div; full transcendental support.
+	* Per-thread bump arena and grid-stride launch.
+	* Demos/benchmarks: AXPY, matrix-vector, matrix-matrix, and elementary
+	  function benchmarks for MPFR and MPC.
+	* autoconf-based build system; Markdown manual under doc/.
