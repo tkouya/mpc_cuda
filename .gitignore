@@ -17,3 +17,11 @@
 
 # distribution tarballs
 /mpc_cuda-*.tar.*
+
+# TeX intermediates ('make doc' regenerates them; .tex and .pdf are kept)
+/doc/*.aux
+/doc/*.dvi
+/doc/*.log
+/doc/*.out
+/doc/*.toc
+/doc/*.synctex.gz
