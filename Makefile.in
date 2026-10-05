@@ -243,7 +243,7 @@ check-fixed-gpu: tools/test_fixed_gpu.cu tools/fixed_testgen.h \
 bench-gpu-fixed: tools/bench_gpu_fixed.cu tools/bench_gpu_fixed_cpu.cpp tools/bench_gpu_fixed.h \
              include/mpc_cuda/cu_freal.cuh include/mpc_cuda/cu_fcomplex.cuh
 	$(MKDIR_P) $(BUILD)
-	$(CXX) -O3 -march=native $(OMP_CXXFLAGS) -Iinclude -I$(FLINT_PREFIX)/include $(SYS_MP_INC) \
+	$(CXX) -std=c++17 -O3 -march=native $(OMP_CXXFLAGS) -Iinclude -I$(FLINT_PREFIX)/include $(SYS_MP_INC) \
 	    -c tools/bench_gpu_fixed_cpu.cpp -o $(BUILD)/bench_gpu_fixed_cpu.o
 	$(NVCC) -arch=$(CUDA_ARCH) -O3 -std=c++17 -Iinclude tools/bench_gpu_fixed.cu \
 	    $(BUILD)/bench_gpu_fixed_cpu.o -o $(BUILD)/bench_gpu_fixed \
@@ -263,11 +263,11 @@ check-fixed-host: tools/test_freal_host.cpp tools/fixed_testgen.h \
 	@if test "$(HAVE_SYSTEM_MPC)" != yes; then \
 	  echo "system libmpfr/libmpc (+ headers) not found at configure time; 'make check-fixed-host' needs them"; exit 1; fi
 	$(MKDIR_P) $(BUILD)
-	$(CXX) -O2 -Iinclude $(SYS_MP_INC) tools/test_freal_host.cpp \
+	$(CXX) -std=c++17 -O2 -Iinclude $(SYS_MP_INC) tools/test_freal_host.cpp \
 	    -o $(BUILD)/test_freal_host $(SYS_MP_LIBS)
 	./$(BUILD)/test_freal_host
 	@echo "--- again with -march=native (x86-64 mulx/adx, aarch64 kernels) ---"
-	$(CXX) -O2 -march=native -Iinclude $(SYS_MP_INC) tools/test_freal_host.cpp \
+	$(CXX) -std=c++17 -O2 -march=native -Iinclude $(SYS_MP_INC) tools/test_freal_host.cpp \
 	    -o $(BUILD)/test_freal_host_native $(SYS_MP_LIBS)
 	./$(BUILD)/test_freal_host_native
 bench-host-fixed: tools/bench_host_fixed.cpp \
@@ -275,7 +275,7 @@ bench-host-fixed: tools/bench_host_fixed.cpp \
 	@if test "$(HAVE_SYSTEM_MPC)" != yes; then \
 	  echo "system libmpfr/libmpc (+ headers) not found at configure time; 'make bench-host-fixed' needs them"; exit 1; fi
 	$(MKDIR_P) $(BUILD)
-	$(CXX) -O3 -march=native -Iinclude $(SYS_MP_INC) -I$(FLINT_PREFIX)/include \
+	$(CXX) -std=c++17 -O3 -march=native -Iinclude $(SYS_MP_INC) -I$(FLINT_PREFIX)/include \
 	    tools/bench_host_fixed.cpp -o $(BUILD)/bench_host_fixed \
 	    -L$(FLINT_PREFIX)/lib -Wl,-rpath,$(FLINT_PREFIX)/lib -lflint $(SYS_MP_LIBS)
 	$(BENCH_PIN) ./$(BUILD)/bench_host_fixed
