@@ -24,7 +24,8 @@ static double now_ms(){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
 static int ensure_threads(){
 #ifdef _OPENMP
   static int n = 0;
-  if(!n){ n = omp_get_num_procs(); omp_set_num_threads(n); }
+  //if(!n){ n = omp_get_num_procs(); omp_set_num_threads(n); }
+  if(!n){ n = omp_get_max_threads(); omp_set_num_threads(n); }
   return n;
 #else
   return 1;

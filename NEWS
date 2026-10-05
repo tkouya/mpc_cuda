@@ -1,6 +1,111 @@
 mpc_cuda NEWS -- user-visible changes
 =====================================
 
+Version 0.0.2
+-------------
+
+x86-64 host and GPU performance of the fixed-precision types (measured on a
+Xeon Gold 6526Y core and an H100 NVL), all still bit-exact with MPFR/MPC
+round-to-nearest (make check-fixed, check-fixed-gpu, check-fixed-host,
+check-fmath[-host]).
+
+  * x86-64 (BMI2+ADX, i.e. -march=native on Broadwell or later / Zen): a
+    mulx + adcx/adox multiply kernel and adc/sbb add/sub chains, enabled
+    automatically (-DCU_FP_NO_ASM for portable C).  One core vs the
+    previous code: multiply 1.35x-2.0x faster from 768 bits, complex
+    multiply 2.0x at 64 bits and 1.2x-2.6x from 512 bits, correctly rounded
+    dot 1.6x-2.3x.  Against FLINT 3.6 nfloat built with its ADX assembly (not
+    correctly rounded): multiply 3.8x / 2.4x / 1.5x / 1.06x at 64 / 128 /
+    192 / 256 bits, 0.73x at 384-512 bits and 0.82x-1.04x from 768 to 4096
+    bits (was 0.43x-0.74x); complex multiply 1.26x at 64 bits (was 0.62x)
+    and 0.77x-1.06x from 512 bits (was 0.34x-0.67x); correctly rounded dot
+    product 0.58x-1.09x (was 0.25x-0.61x).  Up to 256 bits the vector loops
+    built from mul+add (axpy, dot) and the correctly rounded fma stay at
+    0.16x-0.5x of nfloat's fused vector kernels.  Always faster than MPFR/MPC (1.1x-15x).
+  * GPU: mulhigh multiply for 256..2048-bit, register-friendly operand
+    selection in add/sub and the complex multiply (far less local memory), a
+    branch-free fixed-point complex multiply up to 2048-bit, 16-byte
+    alignment for even limb counts.  Compute-bound throughput on an H100 vs
+    the previous code: add 1.5x-2.9x, complex multiply 3.3x-9.0x, multiply
+    up to 1.8x (64..2048 bits); streaming element-wise kernels up to 5.7x.
+    The H100 runs them faster than nfloat on all 32 Xeon cores: real ops
+    10x-28x and complex 4.3x-27x up to 1024 bits, 2.6x-14x at 2048 bits,
+    1x-3x at 4096 bits (make bench-gpu-fixed).
+  * New header cu_fwarp.cuh (also in mpc_cuda.cuh): cu_warp_load /
+    cu_warp_store move a warp's 32 consecutive cu_freal / cu_fcomplex
+    elements as one coalesced block through a per-warp shared-memory buffer
+    (static cu_fwarp_buf, or dynamic cu_fwarp_dyn + cu_fwarp_prepare).
+    Memory-bound element-wise kernels 1.24x-1.68x faster on an H100 (real
+    mul/add 128..2048 bits, axpy 1.55x at 2048); arithmetic-bound complex
+    kernels from 2048 bits gain nothing.
+  * New: tools/test_fixed_gpu.cu (make check-fixed-gpu), tools/
+    bench_gpu_fixed.cu (make bench-gpu-fixed); bench_host_fixed interleaves
+    the libraries pass by pass.
+
+Host (CPU) performance of the fixed-precision types, all still bit-exact with
+MPFR/MPC round-to-nearest (earlier round, GB10; device code unchanged then).
+
+  * cu_freal<PB> multiply: a "mulhigh" that drops the low product columns
+    (about half the partial products) with a proven error bound; the full
+    product is recomputed only when the result lies within that bound of a
+    rounding boundary (probability ~2N/2^64).  Kernel chosen by size: a fully
+    unrolled __int128 operand-scanning schoolbook (N <= 22 limbs) and, on
+    aarch64, a two-accumulator product-scanning asm kernel above that;
+    elsewhere a lagged 4-row strip kernel.  Optional GMP kernel for large N
+    (-DCU_FP_HOST_USE_GMP, link -lgmp).
+  * Rounding, normalization and add/sub are branch-free; add/sub use a
+    single adcs/sbcs carry chain on aarch64 (opt-in adc/sbb asm on x86-64 via
+    -DCU_FP_X86_ASM).
+  * cu_fcomplex<PB> multiply: truncated products with a rounding-window test
+    (4 products, N < 8) or a 3-multiplication Karatsuba in one fixed-point
+    frame (N >= 8), with exact fallback.
+  * New header cu_ffused.cuh (host, also via mpc_cuda.cuh): correctly rounded
+    cu_ffma_cr / cu_fdot (= mpfr_fma / mpfr_dot) and cu_cfma_cr / cu_cdot
+    (= mpc_fma / mpc_dot, MPC_RNDNN) -- one rounding per result; cu_ffma /
+    cu_cfma are the faster mul+add.
+  * Single X925 core of a GB10, 65536 elements, 64..4096 bits, vs. the previous 0.0.2 snapshot:
+    multiply 1.8x-3.0x faster, complex multiply 1.6x-4.0x, add 1.5x-1.9x,
+    dot/axpy loops 1.3x-2.9x.  Against FLINT 3.6 nfloat (which is NOT
+    correctly rounded): multiply faster up to 384 bits (3.4x at 64 bits),
+    0.8-0.9x at 512-2048 bits, 0.6x at 3072-4096; add 0.6x-1.1x; complex
+    multiply 0.46x-0.82x.
+  * New: tools/test_freal_host.cpp (`make check-fixed-host`: host bit-exact
+    check incl. rounding corner cases, the mulhigh error bound, fma and dot),
+    tools/bench_host_fixed.cpp (`make bench-host-fixed`: vs nfloat and
+    MPFR/MPC), tools/tune_host_fixed.sh (validate + benchmark the build
+    variants on the target machine, e.g. x86-64; no CUDA needed).
+  * CPU-only build: ./configure without nvcc (or --without-cuda) sets up the
+    header-only fixed-precision host part -- make (host sample), make check
+    (bit-exact + elementary-function checks, the GPU tests reused via
+    tools/cuda_host_shim.h), make install (headers + header-only .pc).  New
+    single include for the host: mpc_cuda_host.h.
+  * Tunables: CU_FP_MULHIGH_MIN_N, CU_FP_CMUL_FAST_MIN_N, CU_FP_CKARA_MIN_N,
+    CU_FP_OPSCAN_MAX_N, CU_FP_GMP_MIN_N; CU_FP_NO_ASM disables all host asm.
+
+
+Performance: much faster multiple-precision multiplication on the device.
+
+  * New register-resident base multiply (cu_mpn_mul).  For equal-size operands
+    of 4..32 limbs (256..2048 bits) the schoolbook product is now computed
+    entirely in registers with a fully-unrolled 32-bit product-scanning (comba)
+    inner loop and a mul.lo/mul.hi + add.cc/addc carry chain, instead of
+    accumulating through the per-thread global-memory arena with a runtime limb
+    count.  This removes the performance cliff that began at 256-bit precision.
+
+    Measured on an NVIDIA H100 (sm_90), base multiply throughput vs. the
+    previous generic path:  4.4x at 512-bit, 9.6x at 1024-bit, 15.9x at
+    1536-bit, 24.5x at 2048-bit.  Results are bit-identical to the previous
+    implementation across all sizes.
+
+    The fast path is device-only (GMP_NUMB_BITS == 64) and benefits every
+    caller that reaches mpn_mul with equal operand sizes: mpfr_mul, mpfr_sqr,
+    and hence the MPC complex routines.  Precisions above 2048 bits, unequal
+    operand sizes, and the host build fall back to the previous portable loop.
+    Define CU_MPN_MUL_NO_COMBA to disable the fast path.
+
+  * New tests: tests/test_combamul.cu (device vs. host bit-exactness across
+    operand sizes) and tests/test_combaperf.cu (base-multiply throughput).
+
 Version 0.0.1 (initial release)
 -------------------------------
 

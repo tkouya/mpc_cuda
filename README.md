@@ -1,6 +1,6 @@
 # mpc_cuda
 
-**Version 0.0.1** &nbsp;·&nbsp; LGPL-3.0-or-later
+**Version 0.0.2** &nbsp;·&nbsp; LGPL-3.0-or-later
 
 A CUDA port of the GNU multiple-precision stack — **mini-gmp → MPFR → MPC** —
 so that arbitrary-precision integer, correctly-rounded floating-point, and
@@ -21,6 +21,25 @@ sudo make install          # headers, libmpc_cuda.a/.so, mpc_cuda-link, mpc_cuda
 
 Then link your own kernel: `mpc_cuda-link my_kernel.cu my_program` (after install)
 or `tools/build_cuda_test.sh my_kernel.cu my_program` (in the build tree).
+
+**Without CUDA (CPU only).** The fixed-precision types (`cu_freal<PB>`,
+`cu_fcomplex<PB>`, the correctly-rounded fused ops and the elementary functions)
+are header-only and need only a C++17 compiler. If `nvcc` is not found (or with
+`--without-cuda`), `./configure` sets up a CPU-only build:
+
+```sh
+./configure --without-cuda   # no nvcc / python3 needed
+make                         # build + run the host sample (demos/sample_fixed_host.cpp)
+make check                   # bit-exact vs system MPFR/MPC (+ elementary-function ULP check)
+make bench-host-fixed        # timing vs FLINT nfloat / MPFR / MPC (--with-flint-prefix=DIR)
+make install                 # headers (mpc_cuda_host.h, mpc_cuda/cu_f*.cuh) + mpc_cuda.pc
+```
+
+```cpp
+#include "mpc_cuda_host.h"          // g++ -std=c++17 -O2 -march=native -Iinclude ...
+cu_fp::cu_freal<256> a = 1.5, b = 2.25;
+double d = (double)(a*b + a);       // bit-exact with MPFR RNDN at 256 bits
+```
 
 ## Easiest use — one header, coexists with the system GMP/MPFR/MPC
 
@@ -120,6 +139,56 @@ cu_fcomplex<256> z = a*x + y;            // a,x,y complex; + - * operators
 ```
 
 Try it: `make sample-fixed` (real + complex); validate: `make check-fixed`.
+
+**On the host (CPU).** The same headers compile with plain `g++`/`clang++`
+(C++17), and the host path is tuned: multiplies drop the low
+product columns ("mulhigh") with a proven error bound and an exact fallback,
+rounding/add/sub are branch-free with straight `adcs`/`adc` carry chains, the
+multiply kernel uses `mulx` with two carry chains (`adcx`/`adox`) on x86-64
+(BMI2+ADX, i.e. `-march=native`), complex multiply uses a correctly-rounded
+fixed-point Karatsuba, and
+`mpc_cuda/cu_ffused.cuh` adds correctly-rounded `cu_ffma_cr`, `cu_fdot`, `cu_cfma_cr`,
+`cu_cdot` (= `mpfr_fma`/`mpfr_dot`/`mpc_fma`/`mpc_dot`; plain `cu_ffma`/`cu_cfma`
+are the faster mul+add). Everything stays
+bit-exact with MPFR/MPC (`make check-fixed-host`). Against FLINT 3.6 `nfloat`
+(which is not correctly rounded), one core:
+
+| | real multiply | complex multiply | correctly rounded dot |
+|---|---|---|---|
+| Cortex-X925 (GB10) | 3.4× at 64 bits, ≥1× to 384, 0.8–0.9× at 512–2048 | 0.5–0.8× | — |
+| Xeon Gold 6526Y (x86-64) | 3.9× / 2.4× / 1.5× / 1.07× at 64 / 128 / 192 / 256 bits, 0.73× at 384–512, 0.82–1.03× at 768–4096 | 1.26× at 64 bits, 0.44–0.55× at 128–384, 0.77–1.06× at 512–4096 | 0.58–1.09× |
+
+The x86-64 row is against a FLINT built *with* its ADX assembly — a FLINT/GMP
+whose `configure` misdetects a newer CPU (e.g. as `nehalem`) lacks it and
+makes `nfloat` look up to ~1.6× slower. Small-precision vector loops built
+from mul+add (axpy, dot) and the correctly rounded fma stay at 0.16–0.5× of
+`nfloat`'s fused vector kernels up to 256 bits. `make bench-host-fixed
+FLINT_PREFIX=…` compares against `nfloat` and MPFR/MPC;
+`tools/tune_host_fixed.sh` (no CUDA needed) validates and times the build
+variants (`-DCU_FP_NO_ASM`, `-DCU_FP_HOST_USE_GMP`, …).
+
+**GPU vs all CPU cores.** `make bench-gpu-fixed FLINT_PREFIX=…` times
+element-wise `cu_freal`/`cu_fcomplex` kernels on the GPU against the same
+operations on every CPU core (this library's host path and `nfloat`). An H100
+NVL (the faster of plain and coalesced `cu_fwarp` access) is 10–28× faster than `nfloat` on 32 Xeon cores for real operations and
+4.3–27× for complex ones up to 1024 bits, 2.6–14× at 2048 bits and 1–3× at
+4096 bits — bit-exact throughout (`make check-fixed`, which also runs the
+device-vs-host corner-case test `check-fixed-gpu`).
+
+**Coalesced array access.** Reading an array of these structs one element per
+thread is not coalesced (~1–1.6 TB/s on an H100). `mpc_cuda/cu_fwarp.cuh` (in
+the umbrella) adds `cu_warp_load`/`cu_warp_store`, which move a warp's 32
+consecutive elements as one contiguous block through shared memory:
+
+```cuda
+__shared__ cu_fp::cu_fwarp_buf<F, TPB/32> buf;  F *wb = buf.warp();
+for (long base = cu_fp::cu_warp_first_tile(); base < n; base += cu_fp::cu_warp_tile_stride())
+    cu_fp::cu_warp_store(r, base, n, cu_fp::cu_warp_load(x, base, n, wb) * a, wb);
+```
+
+Memory-bound element-wise kernels run 1.24–1.68× faster (H100, 128–2048
+bits); for large types use dynamic shared memory (`cu_fwarp_dyn` +
+`cu_fwarp_prepare`). See the manual, §8.1.
 
 **Fixed-precision elementary functions** (`cu_fmath.cuh` / `cu_fcmath.cuh`, also
 in the umbrella): `cu_fp::cu_`{`sqrt`,`cbrt`,`exp`,`expm1`,`log`,`log1p`,`sin`,

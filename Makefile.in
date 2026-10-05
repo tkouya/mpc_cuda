@@ -19,6 +19,7 @@ MPFR_SRC     = @MPFR_SRC@
 MPC_SRC      = @MPC_SRC@
 HAVE_SYSTEM_MPFR = @HAVE_SYSTEM_MPFR@
 HAVE_SYSTEM_MPC  = @HAVE_SYSTEM_MPC@
+HAVE_CUDA    = @HAVE_CUDA@
 NM           = @NM@
 SHELL        = /bin/sh
 
@@ -65,11 +66,24 @@ LIBSRC = $(wildcard src/cuda_minigmp.cu src/mpfr_cuda/*.c src/mpfr_cuda/*.h \
 GEN = tools/cudafy_minigmp.py tools/cudafy_mpfr.py tools/cudafy_mpc.py \
       tools/cu_prefix.py tools/cu_rename_syms.txt
 
-.PHONY: all lib regen umbrella check demos matrix bench coexist cputest cpubench \
-        sample sample-fixed check-fixed check-fmath bench3 doc algorithm figures xlsx clean distclean dist dist-xz dist-gzip distcheck install uninstall installcheck help
+.PHONY: all lib regen umbrella check check-cuda check-host check-fmath-host host sample-fixed-host \
+        install-cuda install-host installcheck-cuda installcheck-host demos matrix bench coexist cputest cpubench \
+        sample sample-fixed check-fixed check-fixed-gpu check-fixed-host bench-host-fixed bench-gpu-fixed check-fmath bench3 doc figures xlsx clean distclean dist dist-xz dist-gzip install uninstall installcheck help
 .DEFAULT_GOAL := all
 
+# CUDA builds the GPU library; a CPU-only configure (no nvcc, or --without-cuda)
+# covers just the header-only fixed-precision host part.
+ifeq ($(HAVE_CUDA),yes)
 all: lib
+check: check-cuda
+install: install-cuda
+installcheck: installcheck-cuda
+else
+all: host
+check: check-host
+install: install-host
+installcheck: installcheck-host
+endif
 
 # --- the device-object library (built once) --------------------------------
 lib: $(STAMP)
@@ -106,7 +120,7 @@ $(BUILD):
 $(BUILD)/test_%: tests/test_%.cu $(STAMP)
 	bash tools/link_program.sh $< $@
 
-check: lib
+check-cuda: lib
 	@fail=0; \
 	for t in $(TESTS); do \
 	  echo "=== building+running $$t ==="; \
@@ -200,7 +214,7 @@ bench3: lib $(BUILD)/bench3_cpu.o demos/bench_3way.cu
 # --- fixed-precision fast-path validation (header-only; needs system MPFR) ---
 # Checks cu_freal<PB> mul/add/sub bit-exact vs system MPFR across PB=32..2048
 # (including sub-limb SB=32 precisions).  Needs <mpfr.h>/<gmp.h> + libs.
-check-fixed: tools/test_freal.cu tools/test_fcomplex.cu \
+check-fixed: tools/test_freal.cu tools/test_fcomplex.cu check-fixed-gpu \
              include/mpc_cuda/cu_freal.cuh include/mpc_cuda/cu_fcomplex.cuh
 	@if test "$(HAVE_SYSTEM_MPC)" != yes; then \
 	  echo "system libmpfr/libmpc (+ headers) not found at configure time; 'make check-fixed' needs them"; exit 1; fi
@@ -211,6 +225,101 @@ check-fixed: tools/test_freal.cu tools/test_fcomplex.cu \
 	$(NVCC) -arch=$(CUDA_ARCH) -O3 -fmad=false -Iinclude $(SYS_MP_INC) \
 	    tools/test_fcomplex.cu -o $(BUILD)/test_fcomplex $(SYS_MP_LIBS)
 	./$(BUILD)/test_fcomplex
+
+# check-fixed-gpu: the device path vs the host path on rounding corner cases
+#   (ties, cancellation, exponent gaps, zeros; tools/fixed_testgen.h).  No MPFR.
+check-fixed-gpu: tools/test_fixed_gpu.cu tools/fixed_testgen.h \
+             include/mpc_cuda/cu_freal.cuh include/mpc_cuda/cu_fcomplex.cuh
+	$(MKDIR_P) $(BUILD)
+	$(NVCC) -arch=$(CUDA_ARCH) -O3 -std=c++17 -Iinclude tools/test_fixed_gpu.cu \
+	    -o $(BUILD)/test_fixed_gpu
+	./$(BUILD)/test_fixed_gpu
+
+# bench-gpu-fixed: GPU cu_freal/cu_fcomplex element-wise throughput vs the same
+#   operations on all CPU cores (cu_freal host path and FLINT nfloat, OpenMP).
+#   Needs FLINT >= 3.1 (FLINT_PREFIX).  Build FLINT/GMP for the actual CPU: a
+#   build whose configure misdetects the CPU (e.g. as "nehalem") lacks the
+#   x86-64 ADX assembly and understates nfloat.
+bench-gpu-fixed: tools/bench_gpu_fixed.cu tools/bench_gpu_fixed_cpu.cpp tools/bench_gpu_fixed.h \
+             include/mpc_cuda/cu_freal.cuh include/mpc_cuda/cu_fcomplex.cuh
+	$(MKDIR_P) $(BUILD)
+	$(CXX) -O3 -march=native $(OMP_CXXFLAGS) -Iinclude -I$(FLINT_PREFIX)/include $(SYS_MP_INC) \
+	    -c tools/bench_gpu_fixed_cpu.cpp -o $(BUILD)/bench_gpu_fixed_cpu.o
+	$(NVCC) -arch=$(CUDA_ARCH) -O3 -std=c++17 -Iinclude tools/bench_gpu_fixed.cu \
+	    $(BUILD)/bench_gpu_fixed_cpu.o -o $(BUILD)/bench_gpu_fixed \
+	    -L$(FLINT_PREFIX)/lib -Xlinker -rpath -Xlinker $(FLINT_PREFIX)/lib -lflint $(SYS_MP_LIBS) $(OMP_LIBS)
+	./$(BUILD)/bench_gpu_fixed
+
+# --- host (CPU) fixed-precision path ----------------------------------------
+# check-fixed-host: cu_freal/cu_fcomplex compiled by plain $(CXX), checked
+#   bit-exact vs system MPFR/MPC, including rounding corner cases.
+# bench-host-fixed: single-core ns/op of cu_freal/cu_fcomplex vs FLINT nfloat
+#   and MPFR/MPC, 64..4096 bits.  Needs FLINT >= 3.1 (FLINT_PREFIX=DIR if it is
+#   not under /usr/local); pin to a big core with e.g. BENCH_PIN="taskset -c 5".
+FLINT_PREFIX ?= @FLINT_PREFIX@
+BENCH_PIN    ?=
+check-fixed-host: tools/test_freal_host.cpp tools/fixed_testgen.h \
+             include/mpc_cuda/cu_freal.cuh include/mpc_cuda/cu_fcomplex.cuh
+	@if test "$(HAVE_SYSTEM_MPC)" != yes; then \
+	  echo "system libmpfr/libmpc (+ headers) not found at configure time; 'make check-fixed-host' needs them"; exit 1; fi
+	$(MKDIR_P) $(BUILD)
+	$(CXX) -O2 -Iinclude $(SYS_MP_INC) tools/test_freal_host.cpp \
+	    -o $(BUILD)/test_freal_host $(SYS_MP_LIBS)
+	./$(BUILD)/test_freal_host
+	@echo "--- again with -march=native (x86-64 mulx/adx, aarch64 kernels) ---"
+	$(CXX) -O2 -march=native -Iinclude $(SYS_MP_INC) tools/test_freal_host.cpp \
+	    -o $(BUILD)/test_freal_host_native $(SYS_MP_LIBS)
+	./$(BUILD)/test_freal_host_native
+bench-host-fixed: tools/bench_host_fixed.cpp \
+             include/mpc_cuda/cu_freal.cuh include/mpc_cuda/cu_fcomplex.cuh
+	@if test "$(HAVE_SYSTEM_MPC)" != yes; then \
+	  echo "system libmpfr/libmpc (+ headers) not found at configure time; 'make bench-host-fixed' needs them"; exit 1; fi
+	$(MKDIR_P) $(BUILD)
+	$(CXX) -O3 -march=native -Iinclude $(SYS_MP_INC) -I$(FLINT_PREFIX)/include \
+	    tools/bench_host_fixed.cpp -o $(BUILD)/bench_host_fixed \
+	    -L$(FLINT_PREFIX)/lib -Wl,-rpath,$(FLINT_PREFIX)/lib -lflint $(SYS_MP_LIBS)
+	$(BENCH_PIN) ./$(BUILD)/bench_host_fixed
+
+# --- CPU-only (also usable in a CUDA build) ---------------------------------
+# The fixed-precision types are header-only; 'host' builds and runs the host
+# sample, 'check-host' the host bit-exact/accuracy checks.  The elementary-
+# function checks are the GPU sources tools/test_f*math*.cu compiled as C++
+# (tools/cuda_host_shim.h turns their kernel launch into a host loop).
+HOST_HDRS = include/mpc_cuda/cu_freal.cuh include/mpc_cuda/cu_fcomplex.cuh \
+            include/mpc_cuda/cu_fmath.cuh include/mpc_cuda/cu_fcmath.cuh \
+            include/mpc_cuda/cu_ffused.cuh
+host: sample-fixed-host
+	@echo "CPU-only build: the fixed-precision types are header-only (#include \"mpc_cuda_host.h\")."
+	@echo "Next: make check   (host checks vs MPFR/MPC),  make bench-host-fixed,  make install"
+
+sample-fixed-host: demos/sample_fixed_host.cpp include/mpc_cuda_host.h $(HOST_HDRS)
+	$(MKDIR_P) $(BUILD)
+	$(CXX) -std=c++17 -O2 -Iinclude demos/sample_fixed_host.cpp -o $(BUILD)/sample_fixed_host
+	./$(BUILD)/sample_fixed_host
+
+check-host: check-fixed-host check-fmath-host
+
+check-fmath-host: tools/test_fmath.cu tools/test_fmath3.cu tools/test_fcmath.cu \
+                  tools/cuda_host_shim.h $(HOST_HDRS)
+	@if test "$(HAVE_SYSTEM_MPC)" != yes; then \
+	  echo "system libmpfr/libmpc (+ headers) not found at configure time; 'make check-fmath-host' needs them"; exit 1; fi
+	$(MKDIR_P) $(BUILD)
+	@for t in test_fmath test_fmath3 test_fcmath; do \
+	  echo "$(CXX) -std=c++17 -O2 -x c++ -Iinclude tools/$$t.cu -> $(BUILD)/$${t}_host"; \
+	  $(CXX) -std=c++17 -O2 -x c++ -Iinclude $(SYS_MP_INC) tools/$$t.cu -x none \
+	      -o $(BUILD)/$${t}_host $(SYS_MP_LIBS) && ./$(BUILD)/$${t}_host || exit 1; \
+	done
+
+install-host: mpc_cuda.pc
+	$(MKDIR_P) $(DESTDIR)$(pkgincdir) $(DESTDIR)$(includedir) $(DESTDIR)$(libdir)/pkgconfig
+	$(INSTALL_DATA) $(HOST_HDRS) $(DESTDIR)$(pkgincdir)/
+	$(INSTALL_DATA) include/mpc_cuda_host.h $(DESTDIR)$(includedir)/
+	$(INSTALL_DATA) mpc_cuda.pc $(DESTDIR)$(libdir)/pkgconfig/
+
+installcheck-host:
+	@test -f $(DESTDIR)$(includedir)/mpc_cuda_host.h && test -f $(DESTDIR)$(pkgincdir)/cu_freal.cuh || \
+	  { echo "host headers not installed"; exit 1; }
+	@echo "installcheck: header-only fixed-precision host part present"
 
 # --- fixed-precision elementary-function accuracy check (needs system MPFR/MPC)
 # Reports max ULP error of cu_fp elementary functions vs MPFR/MPC across PB.
@@ -254,32 +363,15 @@ figures:
 xlsx:
 	$(PYTHON) tools/make_benchmark_xlsx.py
 
-# 'make algorithm' builds the algorithm note in both languages: the English
-# doc/algorithm.tex with pdfLaTeX (self-contained TikZ figures, no external
-# files), and the Japanese doc/algorithm.ja.tex with upLaTeX + dvipdfmx (same
-# toolchain as 'make doc').  Run each twice so the table of contents resolves.
-PDFLATEX ?= pdflatex
-algorithm:
-	@command -v $(PDFLATEX) >/dev/null 2>&1 || { echo "need pdfLaTeX (pdflatex); set PDFLATEX=..."; exit 1; }
-	cd doc && $(PDFLATEX) -interaction=nonstopmode -halt-on-error algorithm.tex >/dev/null \
-	       && $(PDFLATEX) -interaction=nonstopmode -halt-on-error algorithm.tex >/dev/null
-	@command -v $(UPLATEX) >/dev/null 2>&1 || { echo "need upLaTeX (uplatex) for the Japanese version; set UPLATEX=..."; exit 1; }
-	cd doc && $(UPLATEX) algorithm.ja.tex && $(UPLATEX) algorithm.ja.tex && $(DVIPDFMX) algorithm.ja
-	cd doc && rm -f algorithm.aux algorithm.log algorithm.out algorithm.toc \
-	               algorithm.ja.aux algorithm.ja.log algorithm.ja.out algorithm.ja.toc algorithm.ja.dvi
-	@echo "built doc/algorithm.pdf (English) and doc/algorithm.ja.pdf (Japanese)"
-
 # --- installation -----------------------------------------------------------
 # Installs the headers (three include roots), the single static + shared
 # library (libmpc_cuda.a / libmpc_cuda.so), the defs file, a generated
 # 'mpc_cuda-link' helper, and the pkg-config file.
-install: lib mpc_cuda.pc
+install-cuda: lib mpc_cuda.pc
 	$(MKDIR_P) $(DESTDIR)$(pkgincdir)/mpfr $(DESTDIR)$(pkgincdir)/mpc
-	$(INSTALL_DATA) include/mpc_cuda/*.h $(DESTDIR)$(pkgincdir)/
-	$(INSTALL_DATA) include/mpc_cuda/cu_freal.cuh include/mpc_cuda/cu_fcomplex.cuh \
-	    include/mpc_cuda/cu_fmath.cuh include/mpc_cuda/cu_fcmath.cuh $(DESTDIR)$(pkgincdir)/
+	$(INSTALL_DATA) include/mpc_cuda/*.h include/mpc_cuda/*.cuh $(DESTDIR)$(pkgincdir)/
 	$(MKDIR_P) $(DESTDIR)$(includedir)
-	$(INSTALL_DATA) include/mpc_cuda.cuh include/mpc_cuda.h $(DESTDIR)$(includedir)/
+	$(INSTALL_DATA) include/mpc_cuda.cuh include/mpc_cuda.h include/mpc_cuda_host.h $(DESTDIR)$(includedir)/
 	cd src/mpfr_cuda && find . -name '*.h' -print | tar -cf - -T - | tar -xf - -C $(DESTDIR)$(pkgincdir)/mpfr
 	cd src/mpc_cuda  && find . -name '*.h' -print | tar -cf - -T - | tar -xf - -C $(DESTDIR)$(pkgincdir)/mpc
 	$(MKDIR_P) $(DESTDIR)$(libdir)
@@ -299,7 +391,7 @@ install: lib mpc_cuda.pc
 	chmod +x $(DESTDIR)$(bindir)/mpc_cuda-link
 	@echo "mpc_cuda $(VERSION) installed under $(prefix)"
 
-installcheck:
+installcheck-cuda:
 	@command -v $(DESTDIR)$(bindir)/mpc_cuda-link >/dev/null 2>&1 || \
 	  { echo "mpc_cuda-link not installed"; exit 1; }
 	@test -f $(DESTDIR)$(libdir)/libmpc_cuda.a || \
@@ -308,6 +400,7 @@ installcheck:
 
 uninstall:
 	rm -rf $(DESTDIR)$(pkgincdir) $(DESTDIR)$(pkgdatadir) $(DESTDIR)$(docdir)
+	rm -f $(DESTDIR)$(includedir)/mpc_cuda_host.h
 	rm -f $(DESTDIR)$(libdir)/libmpc_cuda.a $(DESTDIR)$(libdir)/libmpc_cuda.so \
 	      $(DESTDIR)$(libdir)/pkgconfig/mpc_cuda.pc $(DESTDIR)$(bindir)/mpc_cuda-link
 
@@ -332,20 +425,6 @@ $(distdir):
 	$(MKDIR_P) $(distdir)
 	cp -r $(DISTFILES) $(distdir)/ 2>/dev/null || true
 	find $(distdir) -name '*.o' -delete
-	find $(distdir)/doc \( -name '*.aux' -o -name '*.dvi' -o -name '*.log' \
-	     -o -name '*.out' -o -name '*.toc' \) -delete
-
-# 'make distcheck' self-tests the tarball: build it, unpack into a fresh tree,
-# then configure + make (library) + make algorithm (docs) from that pristine
-# copy.  A clean pass proves the tarball is self-contained and complete.  Needs
-# the full toolchain (nvcc + pdfLaTeX/upLaTeX), like any real build.
-distcheck: dist-xz
-	rm -rf _distcheck
-	$(MKDIR_P) _distcheck
-	tar xJf $(distdir).tar.xz -C _distcheck
-	cd _distcheck/$(distdir) && ./configure && $(MAKE) && $(MAKE) algorithm
-	rm -rf _distcheck
-	@echo "distcheck: $(distdir).tar.xz configures, builds, and documents cleanly"
 
 # --- cleaning ---------------------------------------------------------------
 # Removes only build products.  The committed CUDA-adapted sources (src/, the
@@ -358,7 +437,10 @@ distclean: clean
 	rm -rf autom4te.cache
 
 help:
-	@echo "mpc_cuda $(VERSION) -- make targets:"
+	@echo "mpc_cuda $(VERSION) -- make targets (CUDA: $(HAVE_CUDA)):"
+	@echo "  CPU-only (no CUDA): make / make check / make install cover the header-only"
+	@echo "  fixed-precision host part:  make sample-fixed-host  check-host  check-fixed-host"
+	@echo "  check-fmath-host  bench-host-fixed  install-host"
 	@echo "  make            build the device-object library (no upstream needed)"
 	@echo "  make regen      regenerate the CUDA-adapted sources from upstream"
 	@echo "  make check      build and run the test suite"
@@ -366,10 +448,13 @@ help:
 	@echo "  make sample     build+run the one-file GPU+CPU coexistence sample"
 	@echo "  make sample-fixed  build+run the fixed-precision cu_freal<PB> sample"
 	@echo "  make check-fixed   validate cu_freal/cu_fcomplex bit-exact vs system MPFR/MPC"
+	@echo "  make check-fixed-gpu   device vs host cu_freal/cu_fcomplex on rounding corner cases"
+	@echo "  make bench-gpu-fixed   GPU cu_freal/cu_fcomplex vs all CPU cores (cu_freal host, FLINT nfloat)"
+	@echo "  make check-fixed-host  host (g++) cu_freal/cu_fcomplex bit-exact vs MPFR/MPC"
+	@echo "  make bench-host-fixed  host cu_freal/cu_fcomplex vs FLINT nfloat vs MPFR/MPC (FLINT_PREFIX=)"
 	@echo "  make check-fmath   ULP accuracy of cu_fp elementary functions vs MPFR/MPC"
 	@echo "  make bench3        3-way GPU-fixed vs GPU-runtime vs CPU AXPY, 128..8192-bit"
 	@echo "  make doc           build the bilingual TeX reports -> doc/*.pdf (needs upLaTeX+dvipdfmx)"
-	@echo "  make algorithm     build the algorithm note -> doc/algorithm.pdf (EN, pdfLaTeX) + doc/algorithm.ja.pdf (JA, upLaTeX)"
 	@echo "  make figures/xlsx  regenerate doc figures / benchmark .xlsx (needs python3 matplotlib/xlsxwriter)"
 	@echo "  make demos      build all AXPY / matrix / benchmark demos"
 	@echo "  make matrix     build+run the matrix-vector / matrix-matrix demos"
@@ -379,5 +464,4 @@ help:
 	@echo "  make cpubench   build+run GPU-vs-system-libmpfr/libmpc benchmark"
 	@echo "  make install    install headers, objects, mpc_cuda-link, mpc_cuda.pc"
 	@echo "  make dist       create $(distdir).tar.xz  (dist-gzip for .tar.gz)"
-	@echo "  make distcheck  build the tarball, then configure+make+make algorithm from a fresh unpack"
 	@echo "  make clean / distclean"

@@ -54,4 +54,15 @@
 #include "mpc_cuda/cu_fmath.cuh"
 #include "mpc_cuda/cu_fcmath.cuh"
 
+/* fused, correctly-rounded operations on the fixed-precision types (host
+ * only): cu_fp::cu_ffma_cr / cu_fdot (= mpfr_fma / mpfr_dot) and cu_cfma_cr /
+ * cu_cdot (= mpc_fma / mpc_dot, MPC_RNDNN) -- one rounding per result;
+ * cu_ffma / cu_cfma are the faster mul+add (two roundings). */
+#include "mpc_cuda/cu_ffused.cuh"
+
+/* warp-cooperative, coalesced loads/stores of arrays of the fixed-precision
+ * types on the GPU: cu_fp::cu_warp_load / cu_warp_store with a per-warp
+ * shared-memory buffer (cu_fwarp_buf, or cu_fwarp_dyn + cu_fwarp_prepare). */
+#include "mpc_cuda/cu_fwarp.cuh"
+
 #endif /* MPC_CUDA_UMBRELLA_CUH */

@@ -2,6 +2,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include "cuda_host_shim.h"   /* also builds as plain C++ (CPU-only) */
 #include "mpc_cuda/cu_fcmath.cuh"
 using namespace cu_fp;
 #include <gmp.h>
@@ -48,7 +49,7 @@ template<int PB> static void run(int M,cu_limb seed){
     for(int i=0;i<M;i++){ long ex=(fn==CEXP||fn==CSIN||fn==CCOS||fn==CTAN)?((long)(xs(&seed)%5)-2):((long)(xs(&seed)%7)-3);
       A[i].re=mk<PB>(&seed,ex); A[i].im=mk<PB>(&seed,ex); }
     cudaMemcpy(dA,A,M*sizeof(C),cudaMemcpyHostToDevice);
-    kern<PB><<<(M+127)/128,128>>>(M,fn,dA,dR);
+    CU_LAUNCH(kern<PB>, M, M,fn,dA,dR);
     cudaError_t e=cudaDeviceSynchronize();if(e){printf("PB=%d %s ERR %s\n",PB,NM[fn],cudaGetErrorString(e));continue;}
     cudaMemcpy(R,dR,M*sizeof(C),cudaMemcpyDeviceToHost);
     for(int i=0;i<M;i++){ f2m<PB>(mpc_realref(a),A[i].re); f2m<PB>(mpc_imagref(a),A[i].im);

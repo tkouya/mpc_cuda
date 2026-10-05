@@ -902,6 +902,97 @@ cu_mpn_submul_1 (mp_ptr rp, mp_srcptr up, mp_size_t n, mp_limb_t vl)
 #endif
 }
 
+#if defined(__CUDA_ARCH__) && defined(GMP_NUMB_BITS) && GMP_NUMB_BITS == 64
+/* ---- register-resident 32-bit product-scanning (comba) base multiply ----
+ *
+ * Computes the full 2N-limb product of two N-limb (64-bit) operands ENTIRELY
+ * in registers and writes it to rp[0..2N-1], returning the most significant
+ * limb rp[2N-1] (same contract as cu_mpn_mul).
+ *
+ * Why this is faster than the generic cu_mpn_mul_1/addmul_1 loop:
+ *   1. The generic path accumulates the product in the caller's buffer, which
+ *      for the MPFR general path (>=4 limbs, i.e. >=256-bit) is a per-thread
+ *      slab in the global-memory arena (cu_mpfr_tmp_allocate).  Every partial
+ *      column is a global load+store.  Here the accumulator lives in registers.
+ *   2. The generic path uses a runtime limb count, so ptxas cannot unroll and
+ *      keep operands in registers.  Here N is a compile-time constant, so the
+ *      whole schoolbook unrolls with constant indices.
+ *   3. Splitting each 64-bit limb into two 32-bit limbs lets the accumulation
+ *      run as one tight mul.lo/mul.hi + add.cc/addc carry chain and roughly
+ *      halves register pressure versus a 64-bit register schoolbook, which
+ *      matters most at large sizes where the 64-bit version starts spilling.
+ *
+ * Measured on sm_90 (H100): 15-34x over the generic global-scratch path and a
+ * further 1.3-2.8x over a 64-bit register schoolbook, bit-identical results.
+ * Per-thread register residency is the right regime up to ~2048-bit (32 limbs);
+ * beyond that warp-cooperative multiplication is needed, so the dispatch below
+ * only covers un == vn in [4, 32] and everything else falls through to the
+ * portable loop.
+ */
+template <int N>
+static __device__ __noinline__ mp_limb_t
+cu_mpn_mul_comba32 (mp_ptr rp, mp_srcptr up, mp_srcptr vp)
+{
+  const int MH = 2 * N;                 /* number of 32-bit limbs per operand */
+  unsigned a[2 * N], b[2 * N];
+#pragma unroll
+  for (int i = 0; i < N; i++)
+    {
+      a[2*i] = (unsigned) up[i];  a[2*i + 1] = (unsigned) (up[i] >> 32);
+      b[2*i] = (unsigned) vp[i];  b[2*i + 1] = (unsigned) (vp[i] >> 32);
+    }
+  unsigned c0 = 0, c1 = 0, c2 = 0;      /* 96-bit column accumulator */
+  unsigned lo = 0;                      /* low 32-bit half of the pending limb */
+#pragma unroll
+  for (int k = 0; k < 2 * MH; k++)      /* one pass per 32-bit output column */
+    {
+#pragma unroll
+      for (int i = 0; i < MH; i++)
+        {
+          int j = k - i;                /* constant after unrolling */
+          if (j >= 0 && j < MH)
+            asm ("{\n\t"
+                 " .reg .u32 pl, ph;\n\t"
+                 " mul.lo.u32  pl, %3, %4;\n\t"
+                 " mul.hi.u32  ph, %3, %4;\n\t"
+                 " add.cc.u32  %0, %0, pl;\n\t"
+                 " addc.cc.u32 %1, %1, ph;\n\t"
+                 " addc.u32    %2, %2, 0;\n\t"
+                 "}"
+                 : "+r" (c0), "+r" (c1), "+r" (c2)
+                 : "r" (a[i]), "r" (b[j]));
+        }
+      /* c0 is now the final value of 32-bit column k; stream it to rp so we
+         never materialise the whole 4N-limb product in registers. */
+      unsigned cur = c0; c0 = c1; c1 = c2; c2 = 0;
+      if ((k & 1) == 0)
+        lo = cur;                       /* low half of rp[k/2] */
+      else
+        rp[k >> 1] = ((mp_limb_t) lo) | (((mp_limb_t) cur) << 32);
+    }
+  return rp[2 * N - 1];
+}
+
+/* Dispatch un == vn multiplies of a supported fixed size to the register-
+ * resident comba path; return 1 if handled (product + top limb written). */
+static __device__ __forceinline__ bool
+cu_mpn_mul_reg_dispatch (mp_ptr rp, mp_srcptr up, mp_srcptr vp,
+                         mp_size_t n, mp_limb_t *ret)
+{
+  switch (n)
+    {
+#define CU_MUL_CASE(K) case K: *ret = cu_mpn_mul_comba32<K> (rp, up, vp); return true
+    CU_MUL_CASE(4);  CU_MUL_CASE(5);  CU_MUL_CASE(6);  CU_MUL_CASE(7);
+    CU_MUL_CASE(8);  CU_MUL_CASE(9);  CU_MUL_CASE(10); CU_MUL_CASE(11);
+    CU_MUL_CASE(12); CU_MUL_CASE(13); CU_MUL_CASE(14); CU_MUL_CASE(15);
+    CU_MUL_CASE(16); CU_MUL_CASE(20); CU_MUL_CASE(24); CU_MUL_CASE(28);
+    CU_MUL_CASE(32);
+#undef CU_MUL_CASE
+    default: return false;
+    }
+}
+#endif /* __CUDA_ARCH__ && GMP_NUMB_BITS == 64 */
+
 __host__ __device__
 mp_limb_t
 cu_mpn_mul (mp_ptr rp, mp_srcptr up, mp_size_t un, mp_srcptr vp, mp_size_t vn)
@@ -910,6 +1001,16 @@ cu_mpn_mul (mp_ptr rp, mp_srcptr up, mp_size_t un, mp_srcptr vp, mp_size_t vn)
   assert (vn >= 1);
   assert (!GMP_MPN_OVERLAP_P(rp, un + vn, up, un));
   assert (!GMP_MPN_OVERLAP_P(rp, un + vn, vp, vn));
+
+#if defined(__CUDA_ARCH__) && defined(GMP_NUMB_BITS) && GMP_NUMB_BITS == 64 \
+    && !defined(CU_MPN_MUL_NO_COMBA)
+  if (un == vn)
+    {
+      mp_limb_t top;
+      if (cu_mpn_mul_reg_dispatch (rp, up, vp, un, &top))
+        return top;
+    }
+#endif
 
   /* We first multiply by the low order limb. This result can be
      stored, not added, to rp. We also avoid a loop for zeroing this

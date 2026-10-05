@@ -41,6 +41,18 @@ cu_mk_term (const cu_freal<PB> &a, const cu_freal<PB> &b)
   return t;
 }
 
+#if defined(__CUDA_ARCH__)
+template<int PB> __device__ __forceinline__ static void   /* hi,lo = c ? (x,y) : (y,x) */
+cu_sel2 (cu_wterm<PB> &hi, cu_wterm<PB> &lo, bool c, const cu_wterm<PB> &x, const cu_wterm<PB> &y)
+{
+  hi.sign = c ? x.sign : y.sign;  lo.sign = c ? y.sign : x.sign;
+  hi.exp  = c ? x.exp  : y.exp;   lo.exp  = c ? y.exp  : x.exp;
+  hi.zero = c ? x.zero : y.zero;  lo.zero = c ? y.zero : x.zero;
+#pragma unroll
+  for (int i=0;i<cu_wterm<PB>::WN;i++){ const cu_limb u=x.M[i], v=y.M[i]; hi.M[i]=c?u:v; lo.M[i]=c?v:u; }
+}
+#endif
+
 template<int PB> __host__ __device__ static int
 cu_wcmp (const cu_wterm<PB> &a, const cu_wterm<PB> &b)
 {
@@ -51,49 +63,304 @@ cu_wcmp (const cu_wterm<PB> &a, const cu_wterm<PB> &b)
 
 /* round(A + B) to PB bits, A,B normalized signed wide terms (exact intermediates) */
 template<int PB> __host__ __device__ static cu_freal<PB>
-cu_round_sum2 (cu_wterm<PB> A, cu_wterm<PB> B)
+cu_round_sum2 (const cu_wterm<PB> &A, const cu_wterm<PB> &B)
 {
-  typedef cu_freal<PB> F; const int WN=cu_wterm<PB>::WN; const int WB=WN+3; /* 128-bit guard + carry */
+  typedef cu_freal<PB> F; const int WN=cu_wterm<PB>::WN;
   if (A.zero && B.zero){ F r; r.set_zero(); return r; }
+#if defined(__CUDA_ARCH__)
+  if (A.zero || B.zero)
+    {                         /* finalize indexes its input at runtime offsets:
+                                 give it a copy, so A.M and B.M stay in registers */
+      const bool z = A.zero;
+      cu_limb C[WN];
+      for (int i=0;i<WN;i++) C[i] = z ? B.M[i] : A.M[i];
+      return F::finalize (C, WN, WN*64-1, (z ? B.exp : A.exp)-1, 0,0, z ? B.sign : A.sign);
+    }
+#else
   if (A.zero) return F::finalize (B.M, WN, WN*64-1, B.exp-1, 0,0, B.sign);
   if (B.zero) return F::finalize (A.M, WN, WN*64-1, A.exp-1, 0,0, A.sign);
-  if (cu_wcmp<PB>(A,B)<0){ cu_wterm<PB> t=A; A=B; B=t; }   /* ensure |A|>=|B| */
-  long d = A.exp - B.exp;
-  cu_limb AB[WB], BB[WB]; cu_limb sticky=0;
-  for (int i=0;i<WB;i++){ AB[i]=0; BB[i]=0; }
-  for (int i=0;i<WN;i++) AB[i+2]=A.M[i];                   /* A at limbs[2..WN+1] */
-  if (d < (long)WB*64){
-    cu_limb T[WB]; for(int i=0;i<WB;i++) T[i]=0;
-    for (int i=0;i<WN;i++) T[i+2]=B.M[i];
-    long ws=d>>6; int bs=(int)(d&63);
-    for (long i=0;i<ws && i<WB;i++) sticky |= (T[i]!=0);
-    if (bs && ws<WB) sticky |= (T[ws] & (((cu_limb)1<<bs)-1))!=0;
-    for (int i=0;i<WB;i++){ long s=ws+i;
-      cu_limb x=(s<WB)?T[s]:0, y=(s+1<WB)?T[s+1]:0; BB[i]= bs?((x>>bs)|(y<<(64-bs))):x; }
-  } else sticky=1;
-  cu_limb D[WB]; int sgn=A.sign;
-  if (A.sign==B.sign){
-    cu_limb c=0; for(int i=0;i<WB;i++){ cu_limb s=AB[i]+c; c=(s<c); s+=BB[i]; c+=(s<BB[i]); D[i]=s; }
-  } else {
-    cu_limb br=0; for(int i=0;i<WB;i++){ cu_limb ai=AB[i],bi=BB[i]; cu_limb s=ai-bi; cu_limb bb=(ai<bi);
-      cu_limb s2=s-br; bb|=(s<br); D[i]=s2; br=bb; }
-    if (sticky){ cu_limb bb=1; for(int i=0;i<WB && bb;i++){ cu_limb s=D[i]-bb; bb=(D[i]<bb); D[i]=s; } }
-  }
-  int hl=-1; for(int i=WB-1;i>=0;i--){ if(D[i]){ hl=i; break; } }
-  if (hl<0){ F r; r.set_zero(); return r; }
-  int top=63; { cu_limb v=D[hl]; while(!((v>>top)&1)) top--; }
-  int msb=hl*64+top;
-  long Ehi = A.exp - (long)(WN+2)*64 + msb;
-  return F::finalize (D, WB, msb, Ehi, 0, sticky, sgn);
+#endif
+  const bool sub = (A.sign!=B.sign);
+  if constexpr (CU_FP_SEL_BYVAL(WN))
+    {
+      CU_FP_SELECT2 (cu_wterm<PB>, X, Y, cu_wcmp<PB>(A,B)>=0, A, B);   /* |X| >= |Y| */
+      return cu_sum_round<PB,WN> (X.M, X.exp, Y.M, Y.exp, sub, X.sign);
+    }
+  else
+    {
+      if (cu_wcmp<PB>(A,B)<0)                                     /* ensure |A|>=|B| */
+        return cu_sum_round<PB,WN> (B.M, B.exp, A.M, A.exp, sub, B.sign);
+      return cu_sum_round<PB,WN> (A.M, A.exp, B.M, B.exp, sub, A.sign);
+    }
 }
 
-/* correctly-rounded  a*b - c*d  and  a*b + c*d  (RNDN, PB bits) */
+/* correctly-rounded  a*b + sgn*c*d  from the exact 2N-limb products */
+template<int PB> __host__ __device__ CU_FP_COLD static cu_freal<PB>
+cu_fmmas_exact (const cu_freal<PB>&a,const cu_freal<PB>&b,const cu_freal<PB>&c,const cu_freal<PB>&d, int sgn)
+{ cu_wterm<PB> t1=cu_mk_term<PB>(a,b), t2=cu_mk_term<PB>(c,d); t2.sign*=sgn; return cu_round_sum2<PB>(t1,t2); }
+
+/* ---- fast path: truncated products + an error-window rounding test ----
+ * A truncated product keeps the columns >= N-3, i.e. limbs N-3..2N-1 of the
+ * product (WT = N+3 limbs).  The dropped part is < N units of limb 1 (see
+ * cu_mul_cols), i.e. < 2N units of limb 1 after the 0/1-bit normalization --
+ * unless all dropped partial products are zero (the low N-3 limbs of a or of
+ * b vanish, e.g. operands converted from double), in which case the term is
+ * exact.  The two truncated terms are summed exactly by cu_sum_round, which
+ * puts A's limb 1 at D[2], the word G just below the round word R.  With the
+ * one-bit renormalization of a subtraction the result is then known to within
+ * eu = 4N units of G per inexact term, and cu_sum_round accepts the rounding
+ * only if G stays eu clear of 0 and 2^64 (so H and R are exact and the sticky
+ * bit is set) and the cancellation was at most one bit.  Otherwise (prob.
+ * ~eu/2^63 for random data) the exact 2N-limb products are used.  The device
+ * kernel keeps a superset of those columns (see the device cu_mul_cols), with
+ * a far smaller dropped part, so the same bounds hold there.              */
+template<int PB> struct cu_tterm {
+  static const int WT = cu_freal<PB>::N + 3;
+  int sign; long exp; bool exact; cu_limb M[WT];    /* MSB of M set */
+};
+
+/* truncated |a*b|, a and b nonzero */
+template<int PB> __host__ __device__ CU_FP_HOT_INLINE static inline void
+cu_mk_tterm (cu_tterm<PB> &t, const cu_freal<PB> &a, const cu_freal<PB> &b)
+{
+  const int N=cu_freal<PB>::N, WT=cu_tterm<PB>::WT;
+  t.sign=a.sign*b.sign;
+#if defined(__CUDA_ARCH__)
+  cu_mul_cols<N,N-3> (t.M, a.m, b.m);
+#else
+  if constexpr (N > CU_FP_OPSCAN_MAX_N) cu_mul_cols_ool<N,N-3> (t.M, a.m, b.m);  /* keep code small */
+  else                                  cu_mul_cols<N,N-3> (t.M, a.m, b.m);
+#endif
+  cu_limb za=0, zb=0;
+  for (int i=0;i<N-3;i++){ za|=a.m[i]; zb|=b.m[i]; }
+  t.exact = (za==0) || (zb==0);
+  const cu_limb sh = 1 - (t.M[WT-1]>>63), msk=(cu_limb)0-sh;
+  for (int i=WT-1;i>0;i--) t.M[i]=(t.M[i]<<sh)|((t.M[i-1]>>63)&msk);
+  t.M[0]<<=sh; t.exp = a.exp + b.exp - (long)sh;
+}
+
+#if defined(__CUDA_ARCH__)
+template<int PB> __device__ __forceinline__ static void   /* hi,lo = c ? (x,y) : (y,x) */
+cu_sel2 (cu_tterm<PB> &hi, cu_tterm<PB> &lo, bool c, const cu_tterm<PB> &x, const cu_tterm<PB> &y)
+{
+  hi.sign  = c ? x.sign  : y.sign;   lo.sign  = c ? y.sign  : x.sign;
+  hi.exp   = c ? x.exp   : y.exp;    lo.exp   = c ? y.exp   : x.exp;
+  hi.exact = c ? x.exact : y.exact;  lo.exact = c ? y.exact : x.exact;
+#pragma unroll
+  for (int i=0;i<cu_tterm<PB>::WT;i++){ const cu_limb u=x.M[i], v=y.M[i]; hi.M[i]=c?u:v; lo.M[i]=c?v:u; }
+}
+#endif
+
+template<int PB> __host__ __device__ CU_FP_HOT_INLINE static inline int
+cu_tcmp (const cu_tterm<PB> &a, const cu_tterm<PB> &b)
+{
+  if (a.exp!=b.exp) return a.exp>b.exp?1:-1;
+  for (int i=cu_tterm<PB>::WT-1;i>=0;i--) if (a.M[i]!=b.M[i]) return a.M[i]>b.M[i]?1:-1;
+  return 0;
+}
+
+/* ---- short operands (N <= CU_FP_CSHORT_MAX_N, device: CU_FP_DEV_CSHORT_MAX_N): a*b + sgn*c*d in one fixed-point frame ----
+ * The exact 2N-limb products X (the one with the larger exponent E) and Y
+ * (exponent gap dd < 64) are combined exactly in L = 2N+2 limbs,
+ *   acc = X*2^64 +- Y*2^(64-dd)     (guard limb below, headroom limb above),
+ * in two's complement, then normalized and rounded once (RNDN), all without
+ * data-dependent branches: |acc| < 2^(64(L-1)+1), so a carry is undone by a
+ * 0/1-bit right shift, after which the MSB lies in limb L-2 (one clz) unless
+ * the cancellation went deeper.  The generic path (compare the terms, branch
+ * on add/sub -- mispredicted half the time for random signs) is kept for
+ * zero operands, gaps >= 64 and that deep cancellation.  Host: pays off for
+ * 1-2 limbs (x86-64 Emerald Rapids: 64-bit cmul ~1.5x), beyond that the
+ * truncated/Karatsuba paths are as fast or faster.  GPU: faster than the
+ * exact wide-term path up to 2048-bit (H100: 1.2-1.6x), equal at 4096.   */
+#ifndef CU_FP_CSHORT_MAX_N
+#  define CU_FP_CSHORT_MAX_N 2
+#endif
+#ifndef CU_FP_DEV_CSHORT_MAX_N
+#  define CU_FP_DEV_CSHORT_MAX_N 32
+#endif
+template<int PB> __host__ __device__ CU_FP_HOT_INLINE static inline bool
+cu_fmmas_short (cu_freal<PB> &r, const cu_freal<PB>&a,const cu_freal<PB>&b,
+                const cu_freal<PB>&c,const cu_freal<PB>&d, int sgn)
+{
+  typedef cu_freal<PB> F; const int N=F::N, L=2*N+2;
+  const long e1 = a.exp+b.exp, e2 = c.exp+d.exp;
+  const bool sw = e2 > e1;                          /* X = c*d when its exponent is larger */
+  const long dd = sw ? e2-e1 : e1-e2;
+  if (__builtin_expect (dd >= 64, 0)) return false;
+  cu_limb P1[2*N], P2[2*N];
+  cu_mul_cols<N,0> (P1, a.m, b.m);
+  cu_mul_cols<N,0> (P2, c.m, d.m);
+  const int s1 = a.sign*b.sign, s2 = c.sign*d.sign*sgn;
+#if defined(__CUDA_ARCH__)
+  cu_limb X[2*N], Y[2*N];                 /* by value: a pointer select would put
+                                             P1 and P2 in local memory */
+  for (int i=0;i<2*N;i++){ X[i] = sw ? P2[i] : P1[i]; Y[i] = sw ? P1[i] : P2[i]; }
+#else
+  const cu_limb *X = sw ? P2 : P1, *Y = sw ? P1 : P2;
+#endif
+  const int sx = sw ? s2 : s1, sy = sw ? s1 : s2;
+  const long E = sw ? e2 : e1;
+  const int sh = (int)dd;
+  const cu_limb m = (cu_limb)0 - (cu_limb)(sx != sy);          /* subtract: add ~Y' + 1 */
+  cu_limb acc[L], Ys[L];
+  acc[0]=0; for (int i=0;i<2*N;i++) acc[i+1]=X[i]; acc[L-1]=0;
+  /* Ys = Y*2^(64-sh): Ys[i] = Ye[i]>>sh | Ye[i+1]<<(64-sh), Ye = [0,Y,0];
+   * (x<<1)<<(63-sh) is x<<(64-sh) for sh > 0 and 0 for sh = 0 */
+  Ys[0] = ((Y[0]<<1)<<(63-sh)) ^ m;
+  for (int i=1;i<2*N;i++) Ys[i] = ((Y[i-1]>>sh) | ((Y[i]<<1)<<(63-sh))) ^ m;
+  Ys[2*N] = (Y[2*N-1]>>sh) ^ m;
+  Ys[L-1] = m;
+  { cu_limb cy=m&1; for (int i=0;i<L;i++) acc[i]=cu_addc (acc[i], Ys[i], cy); }
+                       /* (plain C: the compiler keeps these short arrays in
+                          registers, which an asm adc chain on memory prevents) */
+  const cu_limb ng = (cu_limb)0 - (acc[L-1]>>63);               /* negative: negate */
+  { cu_limb cy=ng&1; for (int i=0;i<L;i++) acc[i]=cu_addc (acc[i]^ng, 0, cy); }
+  const int rs = ng ? -sx : sx;
+  const cu_limb C = acc[L-1];                                   /* carry bit: 0 or 1 */
+  cu_limb V[L-1];                                               /* acc >> C */
+  for (int i=0;i<L-1;i++) V[i] = (acc[i]>>C) | ((acc[i+1]<<1)<<(63-C));
+  const cu_limb t = V[L-2];
+  if (__builtin_expect (t==0, 0)) return false;                 /* deep cancellation / zero */
+  const int lz = cu_clz64 (t);
+  cu_limb Nm[L-1];                                              /* V << lz */
+  Nm[0] = V[0]<<lz;
+  for (int i=1;i<L-1;i++) Nm[i] = (V[i]<<lz) | ((V[i-1]>>1)>>(63-lz));
+  cu_limb st = acc[0] & C;                                      /* bit shifted out by >> C */
+  for (int i=0;i<L-2-N;i++) st|=Nm[i];
+  const cu_limb *H = Nm + (L-1-N);
+  r = F::round_make (H, F::round_up (H, Nm[L-2-N], st), E - (long)lz + (long)C, rs);
+  return true;
+}
+
+/* a*b + sgn*c*d, N >= 4 */
+template<int PB> __host__ __device__ CU_FP_HOT_INLINE static inline cu_freal<PB>
+cu_fmmas_fast (const cu_freal<PB>&a,const cu_freal<PB>&b,const cu_freal<PB>&c,const cu_freal<PB>&d, int sgn)
+{
+  typedef cu_freal<PB> F; const int N=F::N, WT=cu_tterm<PB>::WT;
+  const bool z1 = a.is_zero()||b.is_zero(), z2 = c.is_zero()||d.is_zero();
+#if defined(__CUDA_ARCH__)
+  /* device: a zero operand joins the (inlined) exact fallback, so the kernel
+   * holds one copy of it instead of two more multiplies */
+  bool ok = !(z1 || z2);
+  F r;
+  if (ok)
+#else
+  if (z1 || z2)
+    {                                       /* a single product: plain RNDN multiply */
+      if (z1 && z2){ F r; r.set_zero(); return r; }
+      if (z1){ F r = cu_fmul<PB> (c,d); if (sgn<0 && !r.is_zero()) r.sign=-r.sign; return r; }
+      return cu_fmul<PB> (a,b);
+    }
+  bool ok = true;
+  F r;
+#endif
+  {
+    cu_tterm<PB> A, B;
+    cu_mk_tterm<PB> (A, a, b);
+    cu_mk_tterm<PB> (B, c, d);
+    const int sa = A.sign, sb = B.sign*sgn;
+    const cu_limb eu = (cu_limb)(4*N) * ((A.exact?0:1) + (B.exact?0:1));
+    const bool ge = cu_tcmp<PB>(A,B) >= 0;
+    if constexpr (CU_FP_SEL_BYVAL(WT))
+      {
+        CU_FP_SELECT2 (cu_tterm<PB>, X, Y, ge, A, B);              /* |X| >= |Y| */
+        r = cu_sum_round<PB,WT,true> (X.M, X.exp, Y.M, Y.exp, sa!=sb, ge ? sa : sb, eu, &ok);
+      }
+    else
+      r = ge ? cu_sum_round<PB,WT,true> (A.M, A.exp, B.M, B.exp, sa!=sb, sa, eu, &ok)
+             : cu_sum_round<PB,WT,true> (B.M, B.exp, A.M, A.exp, sa!=sb, sb, eu, &ok);
+  }
+  if (__builtin_expect (ok, 1)) return r;
+  return cu_fmmas_exact<PB> (a,b,c,d,sgn);
+}
+
+#if !defined(__CUDA_ARCH__)
+#ifndef CU_FP_CKARA_MIN_N
+#  define CU_FP_CKARA_MIN_N 8
+#endif
+
+/* x (N limbs, MSB-justified) >> delta into N+1 limbs, exactly (2 <= delta < 64) */
+template<int N> CU_FP_HOT_INLINE static inline void
+cu_shift_in (cu_limb *o, const cu_limb *x, int delta)
+{
+  o[0] = x[0] << (64-delta);
+  for (int i=1;i<N;i++) o[i] = (x[i-1]>>delta) | (x[i]<<(64-delta));
+  o[N] = x[N-1] >> delta;
+}
+
+/* o = sx*|x| + sy*|y| for M-limb magnitudes (no overflow); returns the sign */
+template<int M> CU_FP_HOT_INLINE static inline int
+cu_sadd (cu_limb *o, const cu_limb *x, int sx, const cu_limb *y, int sy)
+{
+  if (sx==sy){ cu_limb c=0; for (int i=0;i<M;i++) o[i]=cu_addc (x[i],y[i],c); return sx; }
+  int cmp=0;
+  for (int i=M-1;i>=0;i--) if (x[i]!=y[i]){ cmp = x[i]>y[i] ? 1 : -1; break; }
+  const cu_limb *p = cmp>=0 ? x : y, *q = cmp>=0 ? y : x;
+  cu_limb br=0; for (int i=0;i<M;i++) o[i]=cu_subb (p[i],q[i],br);
+  return cmp>=0 ? sx : sy;
+}
+
+/* Host, all four parts nonzero: 3-multiplication (Karatsuba) complex product
+ * in one fixed-point frame, as nfloat does, but with a rounding test so the
+ * result stays correctly rounded.  With A = max(ea,eb)+2 and C = max(ec,ed)+2
+ * the parts are exact (N+1)-limb integers (when no exponent gap reaches 64),
+ *   s = c(a+b),  t = a(d-c),  u = b(c+d),   re = s-u,  im = s+t,
+ * and each product is a mulhigh of (N+1)-limb operands whose dropped part is
+ * < N-1 units of its limb 1, so re and im are known to < 2(N-1) such units.
+ * Returns false when an exponent gap is too large or a component is too close
+ * to a rounding boundary (or cancels too deeply) for that error. */
+template<int PB> CU_FP_HOT_INLINE static inline bool
+cu_cmul_kara (cu_freal<PB> &re, cu_freal<PB> &im,
+              const cu_freal<PB>&a, const cu_freal<PB>&b, const cu_freal<PB>&c, const cu_freal<PB>&d)
+{
+  const int N=cu_freal<PB>::N, M=N+1, K=M-3, L=2*M-K;     /* L = N+4 */
+  const long A = (a.exp>b.exp ? a.exp : b.exp) + 2, C = (c.exp>d.exp ? c.exp : d.exp) + 2;
+  const long da=A-a.exp, db=A-b.exp, dc=C-c.exp, dd=C-d.exp;
+  if ((da|db|dc|dd) >= 64) return false;
+  cu_limb aa[M], bb[M], cc[M], dd2[M], v[M];
+  cu_shift_in<N> (aa, a.m, (int)da);  cu_shift_in<N> (bb, b.m, (int)db);
+  cu_shift_in<N> (cc, c.m, (int)dc);  cu_shift_in<N> (dd2, d.m, (int)dd);
+  cu_limb S[L], T[L], U[L];
+  int sv = cu_sadd<M> (v, aa, a.sign, bb, b.sign);       /* a+b */
+  cu_mul_cols_ool<M,K> (S, cc, v);  const int ss = c.sign*sv;
+  sv = cu_sadd<M> (v, dd2, d.sign, cc, -c.sign);          /* d-c */
+  cu_mul_cols_ool<M,K> (T, aa, v);  const int st = a.sign*sv;
+  sv = cu_sadd<M> (v, cc, c.sign, dd2, d.sign);           /* c+d */
+  cu_mul_cols_ool<M,K> (U, bb, v);  const int su = b.sign*sv;
+  const long w0 = 64L*K + A + C - 128L*M;
+  const cu_limb ecount = 2*(cu_limb)(K+1);
+  cu_limb D[L];
+  int sr = cu_sadd<L> (D, S, ss, U, -su);                  /* re = s - u */
+  if (!cu_round_fixed<PB,L> (re, D, sr, w0, ecount, 64)) return false;
+  int si = cu_sadd<L> (D, S, ss, T, st);                   /* im = s + t */
+  return cu_round_fixed<PB,L> (im, D, si, w0, ecount, 64);
+}
+#endif /* !__CUDA_ARCH__ */
+
+/* correctly-rounded  a*b + sgn*c*d  and the  a*b - c*d,  a*b + c*d  wrappers (RNDN, PB bits) */
+template<int PB> __host__ __device__ static inline cu_freal<PB>
+cu_fmmas (const cu_freal<PB>&a,const cu_freal<PB>&b,const cu_freal<PB>&c,const cu_freal<PB>&d, int sgn)
+{
+  const int N = cu_freal<PB>::N;
+#if defined(__CUDA_ARCH__)
+  constexpr int short_max = CU_FP_DEV_CSHORT_MAX_N, fast_min = CU_FP_DEV_CMUL_FAST_MIN_N;
+#else
+  constexpr int short_max = CU_FP_CSHORT_MAX_N,     fast_min = CU_FP_CMUL_FAST_MIN_N;
+#endif
+  if constexpr (N <= short_max)
+    {
+      if (!a.is_zero() && !b.is_zero() && !c.is_zero() && !d.is_zero())
+        { cu_freal<PB> r; if (__builtin_expect (cu_fmmas_short<PB> (r,a,b,c,d,sgn), 1)) return r; }
+    }
+  else if constexpr (N >= fast_min && N >= 4) return cu_fmmas_fast<PB> (a,b,c,d,sgn);
+  return cu_fmmas_exact<PB> (a,b,c,d,sgn);
+}
 template<int PB> __host__ __device__ static cu_freal<PB>
 cu_fmms (const cu_freal<PB>&a,const cu_freal<PB>&b,const cu_freal<PB>&c,const cu_freal<PB>&d)
-{ cu_wterm<PB> t1=cu_mk_term<PB>(a,b), t2=cu_mk_term<PB>(c,d); t2.sign=-t2.sign; return cu_round_sum2<PB>(t1,t2); }
+{ return cu_fmmas<PB> (a,b,c,d,-1); }
 template<int PB> __host__ __device__ static cu_freal<PB>
 cu_fmma (const cu_freal<PB>&a,const cu_freal<PB>&b,const cu_freal<PB>&c,const cu_freal<PB>&d)
-{ cu_wterm<PB> t1=cu_mk_term<PB>(a,b), t2=cu_mk_term<PB>(c,d); return cu_round_sum2<PB>(t1,t2); }
+{ return cu_fmmas<PB> (a,b,c,d,1); }
 
 /* ============================ the complex type ============================ */
 template<int PB>
@@ -120,8 +387,18 @@ cu_csub (const cu_fcomplex<PB>&a,const cu_fcomplex<PB>&b)
 { return cu_fcomplex<PB>(cu_fsub<PB>(a.re,b.re), cu_fsub<PB>(a.im,b.im)); }
 template<int PB> __host__ __device__ static inline cu_fcomplex<PB>
 cu_cmul (const cu_fcomplex<PB>&a,const cu_fcomplex<PB>&b)
-{ return cu_fcomplex<PB>(cu_fmms<PB>(a.re,b.re,a.im,b.im),     /* ar*br - ai*bi */
-                         cu_fmma<PB>(a.re,b.im,a.im,b.re)); }  /* ar*bi + ai*br */
+{
+#if !defined(__CUDA_ARCH__)
+  if constexpr (cu_freal<PB>::N >= CU_FP_CKARA_MIN_N)
+    if (!a.re.is_zero() && !a.im.is_zero() && !b.re.is_zero() && !b.im.is_zero())
+      {
+        cu_fcomplex<PB> r;
+        if (__builtin_expect (cu_cmul_kara<PB> (r.re, r.im, a.re, a.im, b.re, b.im), 1)) return r;
+      }
+#endif
+  return cu_fcomplex<PB>(cu_fmms<PB>(a.re,b.re,a.im,b.im),     /* ar*br - ai*bi */
+                         cu_fmma<PB>(a.re,b.im,a.im,b.re));    /* ar*bi + ai*br */
+}
 
 template<int PB> __host__ __device__ static inline cu_fcomplex<PB>
 operator+ (const cu_fcomplex<PB>&a,const cu_fcomplex<PB>&b){ return cu_cadd<PB>(a,b); }

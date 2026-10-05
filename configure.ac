@@ -6,19 +6,34 @@
 # (no automake).  ./configure substitutes the discovered tools and paths.
 
 AC_PREREQ([2.69])
-AC_INIT([mpc_cuda], [0.0.1], [tkouya@gmail.com])
+AC_INIT([mpc_cuda], [0.0.2], [tkouya@gmail.com])
 AC_CONFIG_SRCDIR([tools/cudafy_mpfr.py])
 
-# --- required tools ---------------------------------------------------------
+# --- CUDA (optional): without it, a CPU-only build ---------------------------
+# The fixed-precision types (cu_freal / cu_fcomplex / cu_ffused / elementary
+# functions) are header-only and work with any C++17 host compiler.  When nvcc
+# is not found (or --without-cuda is given) the package configures in CPU-only
+# mode: 'make' / 'make check' / 'make install' then cover just that host part,
+# and the GPU library, demos and GPU tests are skipped.
+AC_ARG_WITH([cuda],
+  [AS_HELP_STRING([--without-cuda],
+     [CPU-only build: only the header-only fixed-precision host part (default: use CUDA if nvcc is found)])],
+  [], [with_cuda=check])
 AC_ARG_VAR([NVCC], [NVIDIA CUDA compiler command (default: nvcc)])
-AC_PATH_PROG([NVCC], [nvcc], [no],
-             [$PATH$PATH_SEPARATOR/usr/local/cuda/bin$PATH_SEPARATOR/opt/cuda/bin])
-AS_IF([test "x$NVCC" = xno],
-      [AC_MSG_ERROR([nvcc not found. Install the CUDA Toolkit or set NVCC=/path/to/nvcc.])])
+HAVE_CUDA=no
+AS_IF([test "x$with_cuda" != xno],
+  [AC_PATH_PROG([NVCC], [nvcc], [no],
+                [$PATH$PATH_SEPARATOR/usr/local/cuda/bin$PATH_SEPARATOR/opt/cuda/bin])
+   AS_IF([test "x$NVCC" != xno], [HAVE_CUDA=yes],
+         [test "x$with_cuda" = xyes],
+           [AC_MSG_ERROR([nvcc not found. Install the CUDA Toolkit or set NVCC=/path/to/nvcc.])],
+         [AC_MSG_WARN([nvcc not found: configuring a CPU-only build (fixed-precision host part only)])])],
+  [NVCC=no])
+AC_SUBST([HAVE_CUDA])
 
 AC_ARG_VAR([PYTHON], [Python 3 interpreter (default: python3)])
 AC_PATH_PROG([PYTHON], [python3], [no])
-AS_IF([test "x$PYTHON" = xno],
+AS_IF([test "x$PYTHON" = xno && test "x$HAVE_CUDA" = xyes],
       [AC_MSG_ERROR([python3 not found; it is required to run the transform scripts.])])
 
 AC_PROG_CXX
@@ -101,11 +116,27 @@ AC_CHECK_HEADERS([mpc.h])
 AC_SUBST([HAVE_SYSTEM_MPFR], [$have_system_mpfr])
 AC_SUBST([HAVE_SYSTEM_MPC],  [$have_system_mpc])
 
+# --- optional: FLINT (only for the nfloat comparison in 'make bench-host-fixed')
+AC_ARG_WITH([flint-prefix],
+  [AS_HELP_STRING([--with-flint-prefix=DIR], [prefix of FLINT >= 3.1 for 'make bench-host-fixed' (default: /usr/local)])],
+  [FLINT_PREFIX=$withval], [FLINT_PREFIX=/usr/local])
+have_flint=no
+AS_IF([test -f "$FLINT_PREFIX/include/flint/nfloat.h"], [have_flint=yes])
+AC_SUBST([FLINT_PREFIX])
+
+# --- pkg-config: the CPU-only install is header-only ------------------------
+AS_IF([test "x$HAVE_CUDA" = xyes],
+  [PC_LIBS='-L${libdir} -lmpc_cuda'; PC_LIBS_PRIVATE='-lcudart'],
+  [PC_LIBS=''; PC_LIBS_PRIVATE=''])
+AC_SUBST([PC_LIBS])
+AC_SUBST([PC_LIBS_PRIVATE])
+
 AC_CONFIG_FILES([Makefile mpc_cuda.pc])
 AC_OUTPUT
 
-AC_MSG_NOTICE([
-  mpc_cuda $PACKAGE_VERSION configured:
+AS_IF([test "x$HAVE_CUDA" = xyes],
+[AC_MSG_NOTICE([
+  mpc_cuda $PACKAGE_VERSION configured (CUDA + host):
     nvcc .............. $NVCC
     python3 ........... $PYTHON
     CUDA arch ......... $CUDA_ARCH
@@ -113,10 +144,27 @@ AC_MSG_NOTICE([
     system libmpfr .... $have_system_mpfr   (for 'make coexist' / 'make bench3')
     system libmpc ..... $have_system_mpc   (for 'make cputest' / 'make cpubench')
     MP prefix ......... ${MP_PREFIX:-(system default search path)}
+    FLINT ............. $have_flint   ($FLINT_PREFIX; for 'make bench-host-fixed')
     install prefix .... $prefix
 
   Next:  make            # build the device-object library
          make check      # build and run the test suite
          make demos      # build the AXPY / matrix / benchmark demos
-         make install
-])
+         make check-fixed-host   # host (CPU) fixed-precision check
+])],
+[AC_MSG_NOTICE([
+  mpc_cuda $PACKAGE_VERSION configured: CPU-ONLY (no CUDA)
+    C++ compiler ...... $CXX
+    system libmpfr .... $have_system_mpfr   (needed by 'make check')
+    system libmpc ..... $have_system_mpc   (needed by 'make check')
+    MP prefix ......... ${MP_PREFIX:-(system default search path)}
+    FLINT ............. $have_flint   ($FLINT_PREFIX; for 'make bench-host-fixed')
+    install prefix .... $prefix
+
+  The fixed-precision types are header-only:  #include "mpc_cuda_host.h"
+  Next:  make            # build the host sample
+         make check      # bit-exact checks vs MPFR/MPC (fixed precision, fma/dot,
+                         # elementary functions)
+         make bench-host-fixed   # timing vs FLINT nfloat and MPFR/MPC
+         make install    # headers + pkg-config file
+])])

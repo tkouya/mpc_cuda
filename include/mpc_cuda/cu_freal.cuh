@@ -20,6 +20,14 @@
 #include <cmath>
 #include <cstdint>
 
+/* Optional host GMP kernel for large precisions (see cu_mul_cols). */
+#if defined(CU_FP_HOST_USE_GMP) && !defined(__CUDA_ARCH__)
+#  include <gmp.h>
+#  ifndef CU_FP_GMP_MIN_N
+#    define CU_FP_GMP_MIN_N 24
+#  endif
+#endif
+
 /* Usable from plain host C++ too (no nvcc): make the execution-space tags
  * no-ops when not compiling CUDA.  Under nvcc they are already defined. */
 #if !defined(__CUDACC__)
@@ -29,6 +37,62 @@
 #  ifndef __device__
 #    define __device__
 #  endif
+#endif
+
+/* Host: force-inline the small hot paths so a loop over cu_freal values
+ * compiles to straight-line code (the compiler's own heuristics outline
+ * cu_fmul once its rounding grows).  Device inlining is left to nvcc. */
+#if defined(__CUDA_ARCH__) || !(defined(__GNUC__) || defined(__clang__))
+#  define CU_FP_HOT_INLINE
+#else
+#  define CU_FP_HOT_INLINE __attribute__((always_inline))
+#endif
+
+/* Host: keep rarely-taken fallbacks (exact products after a failed
+ * can-round test) out of line, so the hot path stays small.  (On the GPU a
+ * call costs a register save/restore at the call site; everything inlines.) */
+#if defined(__CUDA_ARCH__) || !(defined(__GNUC__) || defined(__clang__))
+#  define CU_FP_COLD
+#else
+#  define CU_FP_COLD __attribute__((noinline,cold))
+#endif
+
+/* Host loop-unrolling hints for the product-scanning kernels. */
+#if defined(__CUDACC__) || !(defined(__GNUC__) || defined(__clang__))
+#  define CU_FP_UNROLL_ALL
+#  define CU_FP_UNROLL_4
+#elif defined(__clang__)
+#  define CU_FP_UNROLL_ALL _Pragma("unroll")
+#  define CU_FP_UNROLL_4   _Pragma("unroll 4")
+#else
+#  define CU_FP_UNROLL_ALL _Pragma("GCC unroll 128")
+#  define CU_FP_UNROLL_4   _Pragma("GCC unroll 4")
+#endif
+
+/* Host thresholds (limbs) for the truncated-product fast paths. */
+#ifndef CU_FP_MULHIGH_MIN_N
+#  define CU_FP_MULHIGH_MIN_N 6
+#endif
+#ifndef CU_FP_CMUL_FAST_MIN_N
+#  define CU_FP_CMUL_FAST_MIN_N 4
+#endif
+/* Device range (limbs) of the mulhigh multiply: 256..2048-bit (at 4096-bit
+ * the rolled 64-bit rows gain nothing from dropping columns, H100). */
+#ifndef CU_FP_DEV_MULHIGH_MIN_N
+#  define CU_FP_DEV_MULHIGH_MIN_N 4
+#endif
+#ifndef CU_FP_DEV_MULHIGH_MAX_N
+#  define CU_FP_DEV_MULHIGH_MAX_N 32
+#endif
+/* Device threshold (limbs) for the truncated-product complex multiply.  Off
+ * by default: on the GPU its inlined exact fallback keeps all four operands
+ * live and costs more registers than the exact products save (H100). */
+#ifndef CU_FP_DEV_CMUL_FAST_MIN_N
+#  define CU_FP_DEV_CMUL_FAST_MIN_N 1000000
+#endif
+/* Host: largest N for the fully unrolled operand-scanning kernel. */
+#ifndef CU_FP_OPSCAN_MAX_N
+#  define CU_FP_OPSCAN_MAX_N 22
 #endif
 
 namespace cu_fp {
@@ -48,6 +112,355 @@ cu_umul (cu_limb &hi, cu_limb &lo, cu_limb a, cu_limb b)
 #endif
 }
 
+/* ---------------- host multiply kernel ----------------
+ * cu_mul_cols<N,K>(r, a, b): the partial products a[i]*b[j] with i+j >= K,
+ * summed exactly into r[0 .. 2N-1-K] (r[t] has weight 2^(64(K+t))).  K = 0
+ * is the full N x N -> 2N product; K > 0 drops the low columns (a
+ * "mulhigh"), and the dropped part is < (K+1) * 2^(64(K+1)), i.e. less than
+ * K+1 units of r[1].
+ * Three shapes, picked by N (measured on a Cortex-X925, cycles per limb
+ * product in parentheses):
+ *  - N <= 24: operand scanning, fully unrolled, written with __int128 so the
+ *    compiler emits independent adds/cinc pairs (aarch64) or mulx/adc
+ *    (x86-64); the out-of-order core overlaps the rows' carry chains (1.3-1.8).
+ *  - N > 24 on aarch64: product scanning, fully unrolled, each column summed
+ *    into two interleaved 192-bit accumulators (adds/adcs/adc) that are merged
+ *    at the column end, so two flag chains run in parallel (1.7-1.85; the full
+ *    unroll of operand scanning spills registers here and drops to 3-4).
+ *  - N > 24 elsewhere: operand scanning with a rolled outer loop (~2.2).
+ * On x86-64 with BMI2+ADX the mulx/adcx/adox kernel below replaces these
+ * from CU_FP_X86_MULX_MIN_N limbs.                                         */
+#if !defined(__CUDA_ARCH__)
+#if defined(__aarch64__) && !defined(CU_FP_NO_ASM)
+#  define CU_FP_HAVE_MAC2 1
+#  define CU_FP_MAC(c0,c1,c2,x,y) do {                                     \
+     const cu_limb _x=(x), _y=(y);                                         \
+     const cu_limb _lo=_x*_y, _hi=(cu_limb)(((__uint128_t)_x*_y)>>64);     \
+     asm ("adds %0, %0, %3\n\tadcs %1, %1, %4\n\tadc %2, %2, xzr"         \
+          : "+r"(c0), "+r"(c1), "+r"(c2) : "r"(_lo), "r"(_hi) : "cc");      \
+   } while (0)
+#endif
+
+/* x86-64 with BMI2+ADX (e.g. -march=native on Broadwell or later, Zen):
+ * operand scanning with mulx and two independent carry chains, adcx (CF) for
+ * lo+hi of the row and adox (OF) for the running sum r, ~1 cycle per limb
+ * product (the __int128 code is bound by one adc chain, ~2-2.7).  The column
+ * offsets are assembler-time symbols, so each row is straight-line code.
+ *  - N <= CU_FP_X86_UNROLL_MAX_N: every row unrolled, exactly the columns >= K
+ *    (bit-identical to the generic kernel); inlined up to 16 limbs.
+ *  - larger N: rows padded to whole quads (a gets 3 zero limbs below, r 3
+ *    guard limbs) so that rows of equal quad count share one block; the
+ *    padding adds a few partial products below column K, which keeps the
+ *    result between the exact K-sum and the full product, so the bound
+ *    "dropped part < K+1 units of r[1]" still holds.  ~1/4 of the code.   */
+#if defined(__x86_64__) && defined(__BMI2__) && defined(__ADX__) \
+    && !defined(CU_FP_NO_ASM) && !defined(CU_FP_NO_X86_MULX)
+#  define CU_FP_X86_MULX 1
+#  ifndef CU_FP_X86_UNROLL_MAX_N
+#    define CU_FP_X86_UNROLL_MAX_N 33               /* 2048-bit and its Karatsuba parts */
+#  endif
+#  ifndef CU_FP_X86_MULX_MIN_N
+#    define CU_FP_X86_MULX_MIN_N 4              /* below, the inlined __int128 code is as fast */
+#  endif
+
+template<int N, int K> CU_FP_HOT_INLINE static inline void
+cu_mulx_unrolled (cu_limb *r, const cu_limb *a, const cu_limb *b)
+{
+  for (int t=0;t<2*N-K;t++) r[t]=0;
+  cu_limb lo, h0, h1, z;
+  asm volatile (
+    ".set .Lcufpj, 0\n\t"
+    ".rept %c[n]\n\t"
+    "movq 8*.Lcufpj(%[b]), %%rdx\n\t"
+    "xorl %k[z], %k[z]\n\t"                              /* z = 0, CF = OF = 0 */
+    ".set .Lcufpi, %c[k]-.Lcufpj\n\t"
+    ".if .Lcufpi < 0\n\t.set .Lcufpi, 0\n\t.endif\n\t"
+    "mulxq 8*.Lcufpi(%[a]), %[lo], %[h0]\n\t"
+    "adoxq 8*(.Lcufpi+.Lcufpj-%c[k])(%[r]), %[lo]\n\t"
+    "movq %[lo], 8*(.Lcufpi+.Lcufpj-%c[k])(%[r])\n\t"
+    ".set .Lcufpi, .Lcufpi+1\n\t"
+    ".rept (%c[n]-.Lcufpi)/2\n\t"
+    "mulxq 8*.Lcufpi(%[a]), %[lo], %[h1]\n\t"
+    "adcxq %[h0], %[lo]\n\t"
+    "adoxq 8*(.Lcufpi+.Lcufpj-%c[k])(%[r]), %[lo]\n\t"
+    "movq %[lo], 8*(.Lcufpi+.Lcufpj-%c[k])(%[r])\n\t"
+    "mulxq 8*(.Lcufpi+1)(%[a]), %[lo], %[h0]\n\t"
+    "adcxq %[h1], %[lo]\n\t"
+    "adoxq 8*(.Lcufpi+1+.Lcufpj-%c[k])(%[r]), %[lo]\n\t"
+    "movq %[lo], 8*(.Lcufpi+1+.Lcufpj-%c[k])(%[r])\n\t"
+    ".set .Lcufpi, .Lcufpi+2\n\t"
+    ".endr\n\t"
+    ".if .Lcufpi < %c[n]\n\t"
+    "mulxq 8*.Lcufpi(%[a]), %[lo], %[h1]\n\t"
+    "adcxq %[h0], %[lo]\n\t"
+    "adoxq 8*(.Lcufpi+.Lcufpj-%c[k])(%[r]), %[lo]\n\t"
+    "movq %[lo], 8*(.Lcufpi+.Lcufpj-%c[k])(%[r])\n\t"
+    "adcxq %[z], %[h1]\n\t"
+    "adoxq %[z], %[h1]\n\t"
+    "movq %[h1], 8*(%c[n]+.Lcufpj-%c[k])(%[r])\n\t"   /* row carry: a fresh limb */
+    ".else\n\t"
+    "adcxq %[z], %[h0]\n\t"
+    "adoxq %[z], %[h0]\n\t"
+    "movq %[h0], 8*(%c[n]+.Lcufpj-%c[k])(%[r])\n\t"
+    ".endif\n\t"
+    ".set .Lcufpj, .Lcufpj+1\n\t"
+    ".endr"
+    : [lo]"=&r"(lo), [h0]"=&r"(h0), [h1]"=&r"(h1), [z]"=&r"(z)
+    : [r]"r"(r), [a]"r"(a), [b]"r"(b), [n]"i"(N), [k]"i"(K)
+    : "rdx", "cc", "memory");
+}
+
+/* rp[0..4QQ-1] += ap[0..4QQ-1]*b, rp[4QQ] = carry out */
+template<int QQ> CU_FP_HOT_INLINE static inline void
+cu_mulx_row4 (cu_limb *rp, const cu_limb *ap, cu_limb b)
+{
+  cu_limb lo, h0, h1, c, z;
+  asm volatile (
+    "xorl %k[z], %k[z]\n\t"
+    "movl $0, %k[c]\n\t"
+    ".set .Lcufpo, 0\n\t"
+    ".rept %c[q]\n\t"
+    "mulxq 8*.Lcufpo(%[ap]), %[lo], %[h0]\n\t"
+    "adcxq %[c], %[lo]\n\t"
+    "adoxq 8*.Lcufpo(%[rp]), %[lo]\n\t"
+    "movq %[lo], 8*.Lcufpo(%[rp])\n\t"
+    "mulxq 8*.Lcufpo+8(%[ap]), %[lo], %[h1]\n\t"
+    "adcxq %[h0], %[lo]\n\t"
+    "adoxq 8*.Lcufpo+8(%[rp]), %[lo]\n\t"
+    "movq %[lo], 8*.Lcufpo+8(%[rp])\n\t"
+    "mulxq 8*.Lcufpo+16(%[ap]), %[lo], %[h0]\n\t"
+    "adcxq %[h1], %[lo]\n\t"
+    "adoxq 8*.Lcufpo+16(%[rp]), %[lo]\n\t"
+    "movq %[lo], 8*.Lcufpo+16(%[rp])\n\t"
+    "mulxq 8*.Lcufpo+24(%[ap]), %[lo], %[c]\n\t"
+    "adcxq %[h0], %[lo]\n\t"
+    "adoxq 8*.Lcufpo+24(%[rp]), %[lo]\n\t"
+    "movq %[lo], 8*.Lcufpo+24(%[rp])\n\t"
+    ".set .Lcufpo, .Lcufpo+4\n\t"
+    ".endr\n\t"
+    "adcxq %[z], %[c]\n\t"
+    "adoxq %[z], %[c]\n\t"
+    "movq %[c], 8*.Lcufpo(%[rp])"
+    : [lo]"=&r"(lo), [h0]"=&r"(h0), [h1]"=&r"(h1), [c]"=&r"(c), [z]"=&r"(z)
+    : [rp]"r"(rp), [ap]"r"(ap), "d"(b), [q]"i"(QQ) : "cc", "memory");
+}
+
+/* quads in row j (nondecreasing in j) and the row range of a quad count */
+template<int N, int K> constexpr int cu_mulx_rowq (int j)
+{ return (N - ((K-j)>0 ? K-j : 0) + 3)/4; }
+template<int N, int K, int QQ> constexpr int cu_mulx_jlo ()
+{ for (int j=0;j<N;j++) if (cu_mulx_rowq<N,K>(j)==QQ) return j; return N; }
+template<int N, int K, int QQ> constexpr int cu_mulx_jhi ()
+{ int h=-1; for (int j=0;j<N;j++) if (cu_mulx_rowq<N,K>(j)==QQ) h=j; return h; }
+
+template<int N, int K, int QQ> CU_FP_HOT_INLINE static inline void
+cu_mulx_groups (cu_limb *re, const cu_limb *ae, const cu_limb *b)
+{
+  if constexpr (QQ <= (N+3)/4)
+    {
+      constexpr int jlo = cu_mulx_jlo<N,K,QQ>(), jhi = cu_mulx_jhi<N,K,QQ>();
+      _Pragma("GCC unroll 1")                        /* one copy per quad count */
+      for (int j=jlo;j<=jhi;j++)
+        cu_mulx_row4<QQ> (re + 3 + (N-4*QQ) + j - K, ae + 3 + (N-4*QQ), b[j]);
+      cu_mulx_groups<N,K,QQ+1> (re, ae, b);
+    }
+}
+
+template<int N, int K> static inline void
+cu_mulx_grouped (cu_limb *r, const cu_limb *a, const cu_limb *b)
+{
+  constexpr int LR = 2*N-K;
+  cu_limb ae[N+3], re[LR+4];
+  ae[0]=ae[1]=ae[2]=0;
+  for (int i=0;i<N;i++) ae[3+i]=a[i];
+  for (int t=0;t<LR+4;t++) re[t]=0;
+  cu_mulx_groups<N,K,cu_mulx_rowq<N,K>(0)> (re, ae, b);
+  for (int t=0;t<LR;t++) r[t]=re[3+t];
+}
+
+template<int N, int K> __attribute__((noinline)) static void
+cu_mulx_cols_ool (cu_limb *__restrict__ r, const cu_limb *__restrict__ a,
+                  const cu_limb *__restrict__ b)
+{
+  if constexpr (N <= CU_FP_X86_UNROLL_MAX_N) cu_mulx_unrolled<N,K> (r, a, b);
+  else                                       cu_mulx_grouped<N,K> (r, a, b);
+}
+#endif /* CU_FP_X86_MULX */
+
+template<int N, int K> CU_FP_HOT_INLINE static inline void
+cu_mul_cols (cu_limb *r, const cu_limb *a, const cu_limb *b)
+{
+#if defined(CU_FP_HOST_USE_GMP)
+  if constexpr (N >= CU_FP_GMP_MIN_N)
+    {
+      static_assert (sizeof(mp_limb_t)==sizeof(cu_limb), "64-bit GMP limbs required");
+      cu_limb P[2*N];
+      mpn_mul_n ((mp_ptr)P, (mp_srcptr)a, (mp_srcptr)b, N);
+      for (int t=0;t<2*N-K;t++) r[t]=P[K+t];
+      return;
+    }
+  else
+#endif
+#if defined(CU_FP_X86_MULX)
+  if constexpr (N >= CU_FP_X86_MULX_MIN_N && N >= 2 && K < N)
+    {
+      if constexpr (N <= 16) cu_mulx_unrolled<N,K> (r, a, b);
+      else                   cu_mulx_cols_ool<N,K> (r, a, b);
+    }
+  else
+#endif
+  if constexpr (N <= CU_FP_OPSCAN_MAX_N)
+    {
+      for (int t=0;t<2*N-K;t++) r[t]=0;
+      CU_FP_UNROLL_ALL
+      for (int j=0;j<N;j++)
+        {
+          const int i0 = (K-j>0) ? K-j : 0;
+          cu_limb c=0;
+          CU_FP_UNROLL_ALL
+          for (int i=i0;i<N;i++)
+            {
+              __uint128_t t=(__uint128_t)a[i]*b[j] + r[i+j-K] + c;
+              r[i+j-K]=(cu_limb)t; c=(cu_limb)(t>>64);
+            }
+          r[N+j-K]=c;
+        }
+    }
+#if defined(CU_FP_HAVE_MAC2)
+  else
+    {
+      cu_limb c0=0, c1=0, c2=0;
+      CU_FP_UNROLL_ALL
+      for (int k=K;k<2*N-1;k++)
+        {
+          const int lo = (k-(N-1)>0) ? k-(N-1) : 0, hi = (k<N-1) ? k : N-1;
+          cu_limb d0=0, d1=0, d2=0;
+          CU_FP_UNROLL_ALL
+          for (int i=lo;i<=hi;i++)
+            {
+              if ((i-lo)&1) CU_FP_MAC (d0,d1,d2, a[i], b[k-i]);
+              else          CU_FP_MAC (c0,c1,c2, a[i], b[k-i]);
+            }
+          asm ("adds %0, %0, %3\n\tadcs %1, %1, %4\n\tadc %2, %2, %5"
+               : "+r"(c0), "+r"(c1), "+r"(c2) : "r"(d0), "r"(d1), "r"(d2) : "cc");
+          r[k-K]=c0; c0=c1; c1=c2; c2=0;
+        }
+      r[2*N-1-K]=c0;
+    }
+#else
+  else
+    {
+      /* lagged strips of S rows: in step i, row t adds a[i-t]*b[j+t] at
+       * column i+j, so the S carry chains are independent and run in
+       * parallel (a plain row loop is bound by one carry chain per row) */
+      constexpr int S=4, LR=2*N-K;
+      for (int t=0;t<LR;t++) r[t]=0;
+      cu_limb Ap[N+2*S+1];
+      for (int t=0;t<S;t++) Ap[t]=0;
+      for (int t=0;t<N;t++) Ap[S+t]=a[t];
+      for (int t=S+N;t<N+2*S+1;t++) Ap[t]=0;
+      for (int j=0;j<N;j+=S)
+        {
+          cu_limb bt[S], c[S];
+          for (int t=0;t<S;t++){ bt[t]=(j+t<N)?b[j+t]:0; c[t]=0; }
+          const int is = (K-j>0) ? K-j : 0, ie = N-1+S;   /* steps is..ie */
+          cu_limb *rj = r + j - K;
+          for (int i=is;i<=ie && i+j-K<LR;i++)
+            {
+              cu_limb v = rj[i];
+              CU_FP_UNROLL_ALL
+              for (int t=0;t<S;t++)
+                {
+                  __uint128_t x=(__uint128_t)Ap[i-t+S]*bt[t] + v + c[t];
+                  v=(cu_limb)x; c[t]=(cu_limb)(x>>64);
+                }
+              rj[i]=v;
+            }
+          cu_limb cs=0; for (int t=0;t<S;t++) cs+=c[t];    /* leftover carries */
+          for (long p=ie+1+j-K; cs && p<LR; p++){ cu_limb v=r[p]+cs; cs=(v<cs); r[p]=v; }
+        }
+    }
+#endif
+}
+
+/* the same kernel as one shared out-of-line copy: for callers that run several
+ * products back to back (complex multiply, dot), where inlining each fully
+ * unrolled copy would overflow the instruction cache */
+template<int N, int K> __attribute__((noinline)) static void
+cu_mul_cols_ool (cu_limb *__restrict__ r, const cu_limb *__restrict__ a,
+                 const cu_limb *__restrict__ b)
+{ cu_mul_cols<N,K> (r, a, b); }
+#endif /* !__CUDA_ARCH__ */
+
+#if defined(__CUDA_ARCH__)
+/* ---------------- device multiply kernel ----------------
+ * The host contract: r[0 .. 2N-1-K] gets the partial products of columns
+ * >= K exactly (K = 0: the full product), or -- for the 32-bit kernel -- the
+ * 32-bit partial products of 32-bit columns >= 2K, a superset of those, so
+ * that the result lies between the K-column sum and the full product and the
+ * dropped part is < 2K * 2^(64K+32) < K+1 units of r[1] as on the host.
+ *  - 4 <= N <= 32: 32-bit product scanning (comba), fully unrolled, each
+ *    product one fused mad.lo.cc / madc.hi.cc / addc triple into a 96-bit
+ *    column accumulator; finished columns stream out to r.
+ *  - otherwise: 64-bit operand scanning (rows from column K).            */
+template<int N, int K> __device__ __forceinline__ static void
+cu_mul_cols (cu_limb *r, const cu_limb *a, const cu_limb *b)
+{
+  if constexpr (N >= 4 && N <= 32)
+    {
+      constexpr int MH = 2*N;                /* 32-bit limbs per operand */
+      unsigned ah[MH], bh[MH];
+#pragma unroll
+      for (int i=0;i<N;i++)
+        {
+          ah[2*i]=(unsigned)a[i];  ah[2*i+1]=(unsigned)(a[i]>>32);
+          bh[2*i]=(unsigned)b[i];  bh[2*i+1]=(unsigned)(b[i]>>32);
+        }
+      unsigned c0=0, c1=0, c2=0, lo=0;
+#pragma unroll
+      for (int k=2*K;k<2*MH;k++)
+        {
+#pragma unroll
+          for (int i=0;i<MH;i++)
+            {
+              const int j=k-i;
+              if (j>=0 && j<MH)
+                asm ("mad.lo.cc.u32  %0, %3, %4, %0;\n\t"
+                     "madc.hi.cc.u32 %1, %3, %4, %1;\n\t"
+                     "addc.u32       %2, %2, 0;"
+                     : "+r"(c0),"+r"(c1),"+r"(c2) : "r"(ah[i]),"r"(bh[j]));
+            }
+          const unsigned cur=c0; c0=c1; c1=c2; c2=0;
+          if ((k&1)==0) lo=cur;
+          else          r[(k>>1)-K]=((cu_limb)lo)|(((cu_limb)cur)<<32);
+        }
+    }
+  else
+    {                        /* (left to nvcc's unrolling heuristics: a full
+                                unroll at 4096-bit overflows the icache) */
+      for (int t=0;t<2*N-K;t++) r[t]=0;
+      for (int j=0;j<N;j++)
+        {
+          cu_limb cl=0;
+          for (int i=(K-j>0?K-j:0);i<N;i++)
+            {
+              cu_limb hi,lo,rl=r[i+j-K];
+              asm ("mad.lo.cc.u64 %0,%2,%3,%4;\n\t"
+                   "madc.hi.u64   %1,%2,%3,0;\n\t"
+                   "add.cc.u64    %0,%0,%5;\n\t"
+                   "addc.u64      %1,%1,0;"
+                   : "=&l"(lo),"=&l"(hi) : "l"(a[i]),"l"(b[j]),"l"(cl),"l"(rl));
+              r[i+j-K]=lo; cl=hi;
+            }
+          r[N+j-K]=cl;
+        }
+    }
+}
+template<int N, int K> __device__ __forceinline__ static void
+cu_mul_cols_ool (cu_limb *r, const cu_limb *a, const cu_limb *b)
+{ cu_mul_cols<N,K> (r, a, b); }
+#endif /* __CUDA_ARCH__ */
+
 /* ---------------- generic bit helpers over a limb array ---------------- */
 __host__ __device__ static inline cu_limb
 cu_wbit (const cu_limb *W, int len, long i)
@@ -63,9 +476,182 @@ cu_wsticky_below (const cu_limb *W, int len, long i)      /* OR of bits [0..i-1]
   return s!=0;
 }
 
+/* ---------------- fast rounding helpers ----------------
+ * A limb buffer D[len] is read as if extended with one virtual limb below
+ * D[0] holding `ext` (the round bit brnd at bit 63) and zeros above/below. */
+__host__ __device__ static inline int
+cu_clz64 (cu_limb x)
+{
+#if defined(__CUDA_ARCH__)
+  return __clzll ((long long)x);
+#else
+  return __builtin_clzll (x);
+#endif
+}
+
+/* a + b + c (c in {0,1}); returns the sum, c <- carry out */
+__host__ __device__ CU_FP_HOT_INLINE static inline cu_limb
+cu_addc (cu_limb a, cu_limb b, cu_limb &c)
+{
+#if defined(__CUDA_ARCH__)
+  cu_limb s=a+c; cu_limb c1=(s<c); s+=b; c=c1+(s<b); return s;
+#else
+  __uint128_t t=(__uint128_t)a+b+c; c=(cu_limb)(t>>64); return (cu_limb)t;
+#endif
+}
+/* a - b - br (br in {0,1}); returns the difference, br <- borrow out */
+__host__ __device__ CU_FP_HOT_INLINE static inline cu_limb
+cu_subb (cu_limb a, cu_limb b, cu_limb &br)
+{
+#if defined(__CUDA_ARCH__)
+  cu_limb t=a-b; cu_limb b1=(a<b); cu_limb t2=t-br; b1|=(t<br); br=b1; return t2;
+#else
+  __uint128_t t=(__uint128_t)a-b-br; br=(cu_limb)(t>>64)&1; return (cu_limb)t;
+#endif
+}
+
+/* r = a + b + cin over N limbs, returns the carry out; r = a - b - bin,
+ * returns the borrow.  On aarch64 hosts a single adcs/sbcs chain (one flag
+ * dependency per limb, ~1 cycle/limb); on x86-64 a straight-line adc/sbb
+ * chain (the __int128 idiom carries through a register, 2-3 cycles/limb);
+ * elsewhere the __int128 idiom.  -DCU_FP_NO_ASM selects the plain C.      */
+#ifndef CU_FP_X86_ADC_MIN_N
+#  define CU_FP_X86_ADC_MIN_N 4      /* x86-64: shorter chains stay in C (register-resident) */
+#endif
+template<int N> __host__ __device__ CU_FP_HOT_INLINE static inline cu_limb
+cu_add_n (cu_limb *r, const cu_limb *a, const cu_limb *b, cu_limb cin=0)
+{
+#if !defined(__CUDA_ARCH__) && defined(__aarch64__) && !defined(CU_FP_NO_ASM)
+  if constexpr (N >= 2)
+    {
+      const cu_limb *pa=a, *pb=b; cu_limb *pr=r; cu_limb c, t0, t1, u0, u1;
+      long n = N/2;
+      if constexpr (N & 1)
+        asm volatile ("cmp %[ci], #1\n\t"                      /* C = cin */
+                      "ldr %[t0], [%[pa]], #8\n\tldr %[u0], [%[pb]], #8\n\t"
+                      "adcs %[t0], %[t0], %[u0]\n\tstr %[t0], [%[pr]], #8\n\t"
+                      "1:\n\tldp %[t0], %[t1], [%[pa]], #16\n\tldp %[u0], %[u1], [%[pb]], #16\n\t"
+                      "adcs %[t0], %[t0], %[u0]\n\tadcs %[t1], %[t1], %[u1]\n\t"
+                      "stp %[t0], %[t1], [%[pr]], #16\n\tsub %[n], %[n], #1\n\tcbnz %[n], 1b\n\t"
+                      "cset %[c], cs"
+                      : [pa]"+r"(pa), [pb]"+r"(pb), [pr]"+r"(pr), [n]"+r"(n), [c]"=r"(c),
+                        [t0]"=&r"(t0), [t1]"=&r"(t1), [u0]"=&r"(u0), [u1]"=&r"(u1) : [ci]"r"(cin) : "cc", "memory");
+      else
+        asm volatile ("cmp %[ci], #1\n\t"                      /* C = cin */
+                      "1:\n\tldp %[t0], %[t1], [%[pa]], #16\n\tldp %[u0], %[u1], [%[pb]], #16\n\t"
+                      "adcs %[t0], %[t0], %[u0]\n\tadcs %[t1], %[t1], %[u1]\n\t"
+                      "stp %[t0], %[t1], [%[pr]], #16\n\tsub %[n], %[n], #1\n\tcbnz %[n], 1b\n\t"
+                      "cset %[c], cs"
+                      : [pa]"+r"(pa), [pb]"+r"(pb), [pr]"+r"(pr), [n]"+r"(n), [c]"=r"(c),
+                        [t0]"=&r"(t0), [t1]"=&r"(t1), [u0]"=&r"(u0), [u1]"=&r"(u1) : [ci]"r"(cin) : "cc", "memory");
+      return c;
+    }
+#elif !defined(__CUDA_ARCH__) && defined(__x86_64__) && !defined(CU_FP_NO_ASM)
+  if constexpr (N >= CU_FP_X86_ADC_MIN_N)
+    {
+      /* one straight-line adc chain (bt sets CF = cin); r may alias a or b */
+      cu_limb c, t;
+      asm volatile ("bt $0, %[ci]\n\t"
+                    ".set .Lcufpa, 0\n\t"
+                    ".rept %c[n]\n\t"
+                    "movq 8*.Lcufpa(%[pa]), %[t]\n\t"
+                    "adcq 8*.Lcufpa(%[pb]), %[t]\n\t"
+                    "movq %[t], 8*.Lcufpa(%[pr])\n\t"
+                    ".set .Lcufpa, .Lcufpa+1\n\t"
+                    ".endr\n\t"
+                    "setc %b[c]\n\tmovzbl %b[c], %k[c]"
+                    : [c]"=&r"(c), [t]"=&r"(t)
+                    : [pa]"r"(a), [pb]"r"(b), [pr]"r"(r), [ci]"r"(cin), [n]"i"(N) : "cc", "memory");
+      return c;
+    }
+#endif
+  cu_limb c=cin;
+  for (int i=0;i<N;i++) r[i]=cu_addc (a[i], b[i], c);
+  return c;
+}
+template<int N> __host__ __device__ CU_FP_HOT_INLINE static inline cu_limb
+cu_sub_n (cu_limb *r, const cu_limb *a, const cu_limb *b, cu_limb bin=0)
+{
+#if !defined(__CUDA_ARCH__) && defined(__aarch64__) && !defined(CU_FP_NO_ASM)
+  if constexpr (N >= 2)
+    {
+      const cu_limb *pa=a, *pb=b; cu_limb *pr=r; cu_limb c, t0, t1, u0, u1;
+      long n = N/2;
+      if constexpr (N & 1)
+        asm volatile ("subs xzr, xzr, %[ci]\n\t"               /* C = !bin */
+                      "ldr %[t0], [%[pa]], #8\n\tldr %[u0], [%[pb]], #8\n\t"
+                      "sbcs %[t0], %[t0], %[u0]\n\tstr %[t0], [%[pr]], #8\n\t"
+                      "1:\n\tldp %[t0], %[t1], [%[pa]], #16\n\tldp %[u0], %[u1], [%[pb]], #16\n\t"
+                      "sbcs %[t0], %[t0], %[u0]\n\tsbcs %[t1], %[t1], %[u1]\n\t"
+                      "stp %[t0], %[t1], [%[pr]], #16\n\tsub %[n], %[n], #1\n\tcbnz %[n], 1b\n\t"
+                      "cset %[c], cc"
+                      : [pa]"+r"(pa), [pb]"+r"(pb), [pr]"+r"(pr), [n]"+r"(n), [c]"=r"(c),
+                        [t0]"=&r"(t0), [t1]"=&r"(t1), [u0]"=&r"(u0), [u1]"=&r"(u1) : [ci]"r"(bin) : "cc", "memory");
+      else
+        asm volatile ("subs xzr, xzr, %[ci]\n\t"               /* C = !bin */
+                      "1:\n\tldp %[t0], %[t1], [%[pa]], #16\n\tldp %[u0], %[u1], [%[pb]], #16\n\t"
+                      "sbcs %[t0], %[t0], %[u0]\n\tsbcs %[t1], %[t1], %[u1]\n\t"
+                      "stp %[t0], %[t1], [%[pr]], #16\n\tsub %[n], %[n], #1\n\tcbnz %[n], 1b\n\t"
+                      "cset %[c], cc"
+                      : [pa]"+r"(pa), [pb]"+r"(pb), [pr]"+r"(pr), [n]"+r"(n), [c]"=r"(c),
+                        [t0]"=&r"(t0), [t1]"=&r"(t1), [u0]"=&r"(u0), [u1]"=&r"(u1) : [ci]"r"(bin) : "cc", "memory");
+      return c;
+    }
+#elif !defined(__CUDA_ARCH__) && defined(__x86_64__) && !defined(CU_FP_NO_ASM)
+  if constexpr (N >= CU_FP_X86_ADC_MIN_N)
+    {
+      cu_limb c, t;
+      asm volatile ("bt $0, %[ci]\n\t"
+                    ".set .Lcufpa, 0\n\t"
+                    ".rept %c[n]\n\t"
+                    "movq 8*.Lcufpa(%[pa]), %[t]\n\t"
+                    "sbbq 8*.Lcufpa(%[pb]), %[t]\n\t"
+                    "movq %[t], 8*.Lcufpa(%[pr])\n\t"
+                    ".set .Lcufpa, .Lcufpa+1\n\t"
+                    ".endr\n\t"
+                    "setc %b[c]\n\tmovzbl %b[c], %k[c]"
+                    : [c]"=&r"(c), [t]"=&r"(t)
+                    : [pa]"r"(a), [pb]"r"(b), [pr]"r"(r), [ci]"r"(bin), [n]"i"(N) : "cc", "memory");
+      return c;
+    }
+#endif
+  cu_limb br=bin;
+  for (int i=0;i<N;i++) r[i]=cu_subb (a[i], b[i], br);
+  return br;
+}
+
+__host__ __device__ static inline cu_limb
+cu_limb_at (const cu_limb *D, int len, cu_limb ext, long k)
+{ return (k>=0 && k<len) ? D[k] : (k==-1 ? ext : 0); }
+
+/* the 64 bits [pos, pos+63] of D (pos may be negative or past the end) */
+__host__ __device__ static inline cu_limb
+cu_get64 (const cu_limb *D, int len, cu_limb ext, long pos)
+{
+  long w = pos>>6; int b = (int)(pos&63);          /* floor division        */
+  cu_limb lo = cu_limb_at (D,len,ext,w);
+  if (!b) return lo;
+  return (lo>>b) | (cu_limb_at (D,len,ext,w+1)<<(64-b));
+}
+
+/* nonzero iff any bit of D strictly below position pos is set */
+__host__ __device__ static inline cu_limb
+cu_any_below (const cu_limb *D, int len, cu_limb ext, long pos)
+{
+  long w = pos>>6; int b = (int)(pos&63);
+  cu_limb s = 0;
+  for (long k = -1; k < w && k < len; k++) s |= cu_limb_at (D,len,ext,k);
+  if (b) s |= cu_limb_at (D,len,ext,w) & (((cu_limb)1<<b)-1);
+  return s;
+}
+
 /* ============================ the type ============================ */
+/* Even limb counts are 16-byte aligned (the size, 16+8N bytes, is already a
+ * multiple of 16): arrays of cu_freal then load and store with 128-bit
+ * accesses on the GPU, ~1.3x the bandwidth of 64-bit ones for this
+ * array-of-structs layout.  Odd limb counts keep 8 (no padding).          */
 template<int PB>
-struct cu_freal
+struct alignas((((PB+63)/64)%2==0) ? 16 : 8) cu_freal
 {
   static_assert (PB>0 && (PB%32)==0, "PB must be a positive multiple of 32");
   static const int P  = PB;
@@ -80,61 +666,84 @@ struct cu_freal
   __host__ __device__ void set_zero () { sign=1; exp=CU_FREAL_ZERO_EXP;
     for(int i=0;i<N;i++) m[i]=0; }
 
+  /* ---- RNDN core on a normalized head ----
+   * H[N] : the top N*64 bits of the exact magnitude, MSB of H[N-1] set
+   *        (the low SB bits of H[0] lie below the P-bit window)
+   * R    : the next 64 bits below H
+   * round_state() returns 0 (round down), 1 (round up) or 2 (an exact tie so
+   * far: the answer depends on whether anything below R is nonzero -- the
+   * caller computes that sticky bit lazily, only in this rare case).       */
+  __host__ __device__ static int round_state (const cu_limb *H, cu_limb R)
+  {
+    cu_limb rbit, rest, lsb;
+    if constexpr (SB==0){ rbit = R>>63; rest = R<<1; lsb = H[0]&1; }
+    else      { rbit = (H[0]>>(SB-1))&1; rest = (H[0]&(((cu_limb)1<<(SB-1))-1)) | R;
+                lsb  = (H[0]>>SB)&1; }
+    if (!rbit) return 0;
+    return (lsb || rest) ? 1 : 2;
+  }
+  /* branchless variant when the full sticky (everything below R) is known */
+  __host__ __device__ CU_FP_HOT_INLINE static cu_limb round_up (const cu_limb *H, cu_limb R, cu_limb sticky)
+  {
+    cu_limb rbit, rest, lsb;
+    if constexpr (SB==0){ rbit = R>>63; rest = (R<<1)|sticky; lsb = H[0]&1; }
+    else      { rbit = (H[0]>>(SB-1))&1;
+                rest = (H[0]&(((cu_limb)1<<(SB-1))-1)) | R | sticky;
+                lsb  = (H[0]>>SB)&1; }
+    return rbit & (lsb | (cu_limb)(rest!=0));
+  }
+  /* r = H rounded (up if `up`, 0/1), exponent e (MPFR convention), sign sgn.
+   * The increment lands on limb 0 and only rarely carries further, so it is
+   * a copy plus a well-predicted branch rather than an N-limb carry chain. */
+  __host__ __device__ CU_FP_HOT_INLINE static cu_freal round_make (const cu_limb *H, cu_limb up, long e, int sgn)
+  {
+    cu_freal r; r.sign=sgn; r.exp=e;
+    for (int i=0;i<N;i++) r.m[i]=H[i];
+    if (SB) r.m[0] &= ~(((cu_limb)1<<SB)-1);
+    const cu_limb add = up<<SB;
+    r.m[0] += add;
+    if (r.m[0] < add)                              /* carry out of limb 0 */
+      {
+        int i=1; while (i<N && ++r.m[i]==0) i++;
+        if (i==N){ r.m[N-1]=(cu_limb)1<<63; r.exp++; }   /* 0.111..1 -> 1.000..0 */
+      }
+    return r;
+  }
+
+  /* round in place: m[] holds the head (low SB bits still present), R the
+   * next word, sticky anything below */
+  __host__ __device__ CU_FP_HOT_INLINE void round_inplace (cu_limb R, cu_limb sticky)
+  {
+    const cu_limb add = round_up (m, R, sticky)<<SB;
+    if (SB) m[0] &= ~(((cu_limb)1<<SB)-1);
+    m[0] += add;
+    if (m[0] < add)
+      {
+        int i=1; while (i<N && ++m[i]==0) i++;
+        if (i==N){ m[N-1]=(cu_limb)1<<63; exp++; }
+      }
+  }
+
   /* ---- finalize: normalize+round a result into this type ----
    * D[len]    : little-endian magnitude buffer (the significant bits)
    * msb       : index of the result MSB within D (>=0; <0 means zero)
    * Ehi       : value-weight exponent of bit `msb`  (value bit msb has weight 2^Ehi)
    * brnd,bsti : round/sticky material strictly BELOW D bit 0
+   *             (brnd = the bit just below D bit 0, bsti = anything below it)
    * Rounds to P bits (low SB bits forced zero), RNDN.                    */
   __host__ __device__ static cu_freal
   finalize (const cu_limb *D, int len, int msb, long Ehi,
             cu_limb brnd, cu_limb bsti, int sgn)
   {
-    cu_freal r;
-    if (msb<0){ r.set_zero(); return r; }
-    long Eh = Ehi;
-    long lo = (long)msb - P + 1;           /* keep bits [lo .. msb]        */
-    cu_limb V[N];                          /* P-bit value (top SB bits 0)  */
-    cu_limb rbit, sticky;
-    if (lo>0)
-      {
-        rbit   = cu_wbit (D,len,lo-1);
-        sticky = brnd | bsti | cu_wsticky_below (D,len,lo-1);
-        long ws=lo>>6; int bs=(int)(lo&63);
-        for (int i=0;i<N;i++){ long s=ws+i;
-          cu_limb a=(s>=0&&s<len)?D[s]:0, b=(s+1>=0&&s+1<len)?D[s+1]:0;
-          V[i]= bs? ((a>>bs)|(b<<(64-bs))) : a; }
-      }
-    else if (lo==0)
-      {
-        rbit = brnd; sticky = bsti;
-        for (int i=0;i<N;i++) V[i]=(i<len)?D[i]:0;
-      }
-    else /* lo<0: fewer than P significant bits -> exact, left-justify */
-      {
-        rbit=0; sticky=0;
-        int ls=(int)(-lo); int ws=ls>>6, bs=ls&63;
-        for (int i=N-1;i>=0;i--){ int s=i-ws;
-          cu_limb a=(s>=0&&s<len)?D[s]:0, b=(s-1>=0&&s-1<len)?D[s-1]:0;
-          V[i]= bs? ((a<<bs)|(b>>(64-bs))) : a; }
-      }
-    /* round to nearest even at V bit 0 */
-    if (rbit && (sticky || (V[0]&1)))
-      {
-        cu_limb c=1;
-        for (int i=0;i<N && c;i++){ V[i]+=c; c=(V[i]==0); }
-        bool ov = SB ? (((V[(P)>>6]>>(P&63))&1)!=0) : (c!=0);
-        if (ov){ for(int i=0;i<N;i++) V[i]=0;
-                 V[(P-1)>>6]=(cu_limb)1<<((P-1)&63); Eh++; }
-      }
-    /* M = V << SB  (left-justify; low SB bits zero) */
-    if (SB){
-      for (int i=N-1;i>=0;i--){
-        cu_limb a=V[i], b=(i-1>=0)?V[i-1]:0;
-        r.m[i]=(a<<SB)|(b>>(64-SB)); }
-    } else { for (int i=0;i<N;i++) r.m[i]=V[i]; }
-    r.sign=sgn; r.exp=Eh+1;
-    return r;
+    if (msb<0){ cu_freal r; r.set_zero(); return r; }
+    const cu_limb ext = brnd ? ((cu_limb)1<<63) : 0;
+    const long off = (long)msb - (long)N*64 - 63;  /* bit index of R's LSB */
+    cu_limb H[N];
+    for (int i=0;i<N;i++) H[i] = cu_get64 (D,len,ext, off + 64*(i+1));
+    cu_limb R = cu_get64 (D,len,ext, off);
+    int st = round_state (H,R);
+    if (st==2) st = (bsti || cu_any_below (D,len,ext,off)) ? 1 : 0;
+    return round_make (H, (cu_limb)(st==1), Ehi+1, sgn);
   }
 
   /* ---------------- double <-> ---------------- */
@@ -170,46 +779,82 @@ struct cu_freal
   __host__ __device__ explicit operator double () const { return to_double(); }
 };
 
-/* ---------------- N x N -> 2N schoolbook (register-resident) ---------- */
-template<int PB> __host__ __device__ static void
+/* ---------------- N x N -> 2N full product (register-resident) ----------
+ * Host: cu_mul_cols<N,0> (x86-64 mulx/adcx/adox, aarch64 adcs chains, or
+ * __int128).  Device: the 32-bit product-scanning (comba) kernel for
+ * 256..2048-bit -- the 32-bit split roughly halves register pressure versus a
+ * 64-bit schoolbook (the technique of cu_mpn_mul_comba32 in the cu_mpfr path)
+ * -- and a 64-bit schoolbook otherwise.                                     */
+template<int PB> __host__ __device__ CU_FP_HOT_INLINE static inline void
 cu_mul_full (cu_limb r[2*cu_freal<PB>::N],
              const cu_limb a[cu_freal<PB>::N], const cu_limb b[cu_freal<PB>::N])
 {
-  const int N = cu_freal<PB>::N;
-  for (int i=0;i<2*N;i++) r[i]=0;
-  for (int j=0;j<N;j++)
-    {
-      cu_limb cl=0;
-      for (int i=0;i<N;i++)
-        {
-          cu_limb hi,lo,rl=r[i+j];
-#if defined(__CUDA_ARCH__)
-          asm ("mad.lo.cc.u64 %0,%2,%3,%4;\n\t"
-               "madc.hi.u64   %1,%2,%3,0;\n\t"
-               "add.cc.u64    %0,%0,%5;\n\t"
-               "addc.u64      %1,%1,0;"
-               : "=&l"(lo),"=&l"(hi) : "l"(a[i]),"l"(b[j]),"l"(cl),"l"(rl));
-#else
-          cu_umul(hi,lo,a[i],b[j]);
-          cu_limb t=lo+cl; hi+=(t<lo); lo=t; t=lo+rl; hi+=(t<lo); lo=t;
-#endif
-          r[i+j]=lo; cl=hi;
-        }
-      r[N+j]=cl;
-    }
+  cu_mul_cols<cu_freal<PB>::N,0> (r, a, b);
 }
 
-/* ---------------- multiply ---------------- */
-template<int PB> __host__ __device__ static cu_freal<PB>
+/* ---------------- multiply ----------------
+ * Exact path: the 2N-limb product has its MSB at bit 2N*64-1 or 2N*64-2, so
+ * the P-bit window is the top N limbs shifted left by sh = 0 or 1 -- done
+ * branch-free, as is the RNDN decision (random data makes both unpredictable). */
+template<int PB> __host__ __device__ CU_FP_HOT_INLINE static inline cu_freal<PB>
+cu_fmul_round_full (const cu_limb *P2, long e, int sgn)
+{
+  typedef cu_freal<PB> F; const int N=F::N;
+  const cu_limb sh = 1 - (P2[2*N-1]>>63);        /* 1: MSB one bit lower */
+  const cu_limb msk = (cu_limb)0 - sh;           /* all-ones iff sh      */
+  cu_limb H[N], R, s=0;
+  for (int i=N-1;i>=0;i--) H[i]=(P2[N+i]<<sh)|((P2[N+i-1]>>63)&msk);
+  if constexpr (N>=2){
+    R = (P2[N-1]<<sh)|((P2[N-2]>>63)&msk);
+    s = P2[N-2]<<sh;
+    for (int i=0;i<N-2;i++) s|=P2[i];
+  } else R = P2[0]<<sh;
+  cu_limb up = F::round_up (H, R, s);
+  return F::round_make (H, up, e - (long)sh, sgn);
+}
+
+template<int PB> __host__ __device__ CU_FP_COLD static cu_freal<PB>
+cu_fmul_exact (const cu_freal<PB> &a, const cu_freal<PB> &b)
+{
+  cu_limb P2[2*cu_freal<PB>::N];
+  cu_mul_full<PB> (P2, a.m, b.m);
+  return cu_fmul_round_full<PB> (P2, a.exp + b.exp, a.sign*b.sign);
+}
+
+/* N >= 4 (device: 256..2048-bit): a mulhigh drops the columns below N-3,
+ * which costs about half the partial products.  With T = the kept columns
+ * (limbs N-3..2N-1 of the product) the dropped part is < N units of T[1];
+ * after the 0/1-bit normalization the word G just below the round word R is
+ * therefore exact up to an error in [0, 2N).  So H and R are exact unless G >= 2^64-2N (a carry
+ * could reach R), and the sticky bit is known (G != 0) unless G == 0.  Only in
+ * those cases -- G near overflow, or G == 0 on an exact half-way pattern --
+ * is the full product recomputed (probability ~2N/2^64 for random data; exact
+ * ties of sparse operands land here too).                                   */
+template<int PB> __host__ __device__ CU_FP_HOT_INLINE static inline cu_freal<PB>
 cu_fmul (const cu_freal<PB> &a, const cu_freal<PB> &b)
 {
   typedef cu_freal<PB> F; const int N=F::N;
   if (a.is_zero()||b.is_zero()){ F r; r.set_zero(); return r; }
+#if defined(__CUDA_ARCH__)
+  if constexpr (N >= CU_FP_DEV_MULHIGH_MIN_N && N >= 4 && N <= CU_FP_DEV_MULHIGH_MAX_N)
+#else
+  if constexpr (N >= CU_FP_MULHIGH_MIN_N && N >= 4)
+#endif
+    {
+      cu_limb T[N+3];
+      cu_mul_cols<N,N-3> (T, a.m, b.m);
+      const cu_limb sh = 1 - (T[N+2]>>63), msk = (cu_limb)0 - sh;
+      cu_limb H[N];
+      for (int i=N-1;i>=0;i--) H[i]=(T[3+i]<<sh)|((T[2+i]>>63)&msk);
+      const cu_limb R = (T[2]<<sh)|((T[1]>>63)&msk);
+      const cu_limb G = (T[1]<<sh)|((T[0]>>63)&msk);
+      if (__builtin_expect (G >= (cu_limb)0 - 2*N || (G==0 && F::round_state (H,R)==2), 0))
+        return cu_fmul_exact<PB> (a, b);
+      return F::round_make (H, F::round_up (H, R, G), a.exp + b.exp - (long)sh, a.sign*b.sign);
+    }
   cu_limb P2[2*N];
   cu_mul_full<PB> (P2, a.m, b.m);
-  int msb = (P2[2*N-1] & (1ULL<<63)) ? 2*N*64-1 : 2*N*64-2;
-  long Ehi = a.exp + b.exp - 2*N*64 + msb;
-  return F::finalize (P2, 2*N, msb, Ehi, 0,0, a.sign*b.sign);
+  return cu_fmul_round_full<PB> (P2, a.exp + b.exp, a.sign*b.sign);
 }
 
 /* ---------------- magnitude compare ---------------- */
@@ -221,59 +866,257 @@ cu_cmpmag (const cu_freal<PB> &a, const cu_freal<PB> &b)
   return 0;
 }
 
-/* ---------------- magnitude add: |a|+|b| ---------------- */
-template<int PB> __host__ __device__ static cu_freal<PB>
-cu_addmag (cu_freal<PB> a, cu_freal<PB> b, int sgn)
+/* ---------------- round(|A| +- |B|) for normalized WN-limb operands ----------------
+ * Requires |A| >= |B| (strictly greater, or equal for a zero result, when
+ * subtracting).  B is aligned to A in a window of WN+1 limbs (one guard limb
+ * below A); bits of B shifted out below the guard only matter as a sticky bit
+ * `st`.  For a subtraction they are folded in as a borrow, so D is the floor of
+ * the exact difference and `st` says the true value lies strictly above D.  A
+ * sticky borrow needs d > 64, which bounds the cancellation to one bit, so the
+ * round bit always sits well above the guard LSB.  The result is renormalized
+ * branch-free by a 0/1-bit shift (a carry, or a one-bit cancellation); a deeper
+ * cancellation (only possible for d <= 1, hence exact) is normalized by a
+ * general left shift.  Used with WN=N by add/sub and with WN=2N (exact
+ * products) by cu_fmma/cu_fmms.                                               */
+template<int PB, int WN, bool CHK=false> __host__ __device__ static cu_freal<PB>
+cu_sum_round (const cu_limb *Am, long Aexp, const cu_limb *Bm, long Bexp,
+              bool sub, int sgn, cu_limb eu=0, bool *ok=nullptr)
 {
   typedef cu_freal<PB> F; const int N=F::N;
-  if (b.exp>a.exp){ F t=a; a=b; b=t; }
-  long d = a.exp-b.exp;
-  cu_limb Bsh[N]; cu_limb brnd, bsti;
-  if (d>=N*64){ for(int i=0;i<N;i++) Bsh[i]=0; }
-  else { long ws=d>>6; int bs=(int)(d&63);
-    for (int i=0;i<N;i++){ long s=ws+i;
-      cu_limb x=(s<N)?b.m[s]:0, y=(s+1<N)?b.m[s+1]:0;
-      Bsh[i]= bs? ((x>>bs)|(y<<(64-bs))) : x; } }
-  brnd = cu_wbit (b.m,N,d-1); bsti = cu_wsticky_below (b.m,N,d-1);
-  /* sum (N+1 limbs) */
-  cu_limb D[N+1]; cu_limb c=0;
-  for (int i=0;i<N;i++){ cu_limb s=a.m[i]+c; c=(s<c); s+=Bsh[i]; c+=(s<Bsh[i]); D[i]=s; }
-  D[N]=c;
-  int msb = c? N*64 : N*64-1;
-  long Ehi = a.exp - N*64 + msb;
-  return F::finalize (D, N+1, msb, Ehi, brnd, bsti, sgn);
+  const long d = Aexp - Bexp;
+  cu_limb W[WN+1]; cu_limb st=0;
+  if (d < 64)
+    {                                  /* common case: sub-limb alignment */
+      const int bs=(int)d;
+      if (bs){
+        W[0]=Bm[0]<<(64-bs);
+        for (int i=1;i<WN;i++) W[i]=(Bm[i-1]>>bs)|(Bm[i]<<(64-bs));
+        W[WN]=Bm[WN-1]>>bs;
+      } else {
+        W[0]=0; for (int i=1;i<=WN;i++) W[i]=Bm[i-1];
+      }
+    }
+  else if (d >= (long)(WN+1)*64)
+    { for (int i=0;i<=WN;i++) W[i]=0; st=1; }
+  else
+    {
+      cu_limb Bp[2*WN+2];                 /* [0, B, 0...]: B with a guard limb */
+      Bp[0]=0;
+      for (int i=0;i<WN;i++) Bp[i+1]=Bm[i];
+      for (int i=WN+1;i<2*WN+2;i++) Bp[i]=0;
+      const int ws=(int)(d>>6), bs=(int)(d&63);
+      if (bs){ for (int i=0;i<=WN;i++) W[i]=(Bp[i+ws]>>bs)|(Bp[i+ws+1]<<(64-bs));
+               st = Bp[ws] & (((cu_limb)1<<bs)-1); }
+      else   { for (int i=0;i<=WN;i++) W[i]=Bp[i+ws]; }
+      for (int k=1;k<ws;k++) st |= Bp[k];
+      st = (st!=0);
+    }
+  cu_limb D[WN+1];                     /* [guard, A..] */
+  long e = Aexp;
+  if (!sub)
+    {
+      cu_limb c=0;
+      D[0]=W[0];
+      for (int i=1;i<=WN;i++) D[i]=cu_addc (Am[i-1], W[i], c);
+      /* carry: shift right one bit (branch-free) */
+      const cu_limb msk=(cu_limb)0-c;
+      st |= D[0]&c;
+      for (int i=0;i<WN;i++) D[i]=(D[i]>>c)|((D[i+1]<<63)&msk);
+      D[WN]=(D[WN]>>c)|(c<<63);
+      e += (long)c;
+    }
+  else
+    {
+      cu_limb br=st;
+      D[0]=cu_subb (0, W[0], br);
+      for (int i=1;i<=WN;i++) D[i]=cu_subb (Am[i-1], W[i], br);
+      if (D[WN]>>62)
+        {                              /* MSB at bit 63 or 62: 0/1-bit shift */
+          const cu_limb sh=1-(D[WN]>>63), msk=(cu_limb)0-sh;
+          for (int i=WN;i>0;i--) D[i]=(D[i]<<sh)|((D[i-1]>>63)&msk);
+          D[0]<<=sh; e -= (long)sh;
+        }
+      else
+        {                              /* deep cancellation: exact (st==0) */
+          if constexpr (CHK) if (eu){ *ok=false; F r; r.set_zero(); return r; }
+          /* the runtime limb shift works on a copy: indexing D itself with
+           * a runtime offset would put D in GPU local memory on every path */
+          cu_limb Dc[WN+1];
+          for (int i=0;i<=WN;i++) Dc[i]=D[i];
+          int hl=WN; while (hl>=0 && !Dc[hl]) hl--;
+          if (hl<0){ F r; r.set_zero(); return r; }
+          const int lz = (WN-hl)*64 + cu_clz64 (Dc[hl]);
+          const int ws=lz>>6, bs=lz&63;
+          for (int i=WN;i>=0;i--){
+            cu_limb hi = (i-ws>=0) ? Dc[i-ws] : 0;
+            cu_limb lo = (i-ws-1>=0) ? Dc[i-ws-1] : 0;
+            D[i] = bs ? ((hi<<bs)|(lo>>(64-bs))) : hi; }
+          e -= lz;
+        }
+    }
+  /* D[WN] has its MSB set: head = D[WN-N+1..WN], R = D[WN-N], rest below */
+  const cu_limb *H = D + (WN-N+1);
+  if constexpr (CHK)
+    if (eu)
+      {
+        /* the operands are only known to within eu units of G = D[WN-N-1]:
+         * if G stays clear of 0 and 2^64 by eu, H and R are exact and the
+         * bits below R are nonzero; otherwise the caller must recompute. */
+        const cu_limb G = D[WN-N-1];
+        *ok = (G >= eu) && (G < (cu_limb)0 - eu);      /* G+eu <= 2^64-1 */
+        return F::round_make (H, F::round_up (H, D[WN-N], 1), e, sgn);
+      }
+  cu_limb s=st; for (int i=0;i<WN-N;i++) s|=D[i];
+  return F::round_make (H, F::round_up (H, D[WN-N], s), e, sgn);
+}
+
+/* ---------------- round an approximate fixed-point magnitude ----------------
+ * D[0..L-1] approximates a magnitude V (in units of 2^w0: V = D*2^w0 + err)
+ * with |err| < ecount * 2^epos (in the same units).  If that error provably
+ * cannot change the RNDN result -- the 64 bits G just below the round word
+ * stay ecount-units clear of 0 and 2^64, so the head and round word are exact
+ * and the sticky bit is set -- r gets the correctly rounded value and true is
+ * returned; otherwise (cancellation pushed the MSB down too far, or the value
+ * sits within the error of a rounding boundary) false is returned.  The
+ * N+2 words from G upwards always lie inside D (G is at or above bit 0 and
+ * the head ends at the MSB), so they are read with one shifting pass.     */
+template<int PB, int L> __host__ __device__ CU_FP_HOT_INLINE static inline bool
+cu_round_fixed (cu_freal<PB> &r, const cu_limb *D, int sgn, long w0,
+                cu_limb ecount, long epos)
+{
+  typedef cu_freal<PB> F; const int N=F::N;
+  int hl=L-1; while (hl>=0 && !D[hl]) hl--;
+  if (hl<0) return false;
+  const long msb  = (long)hl*64 + 63 - cu_clz64 (D[hl]);
+  const long rpos = msb - (long)N*64 - 63;        /* LSB of the round word R */
+  const long gpos = rpos - 64;                    /* LSB of the guard word G */
+  if (gpos < epos || gpos < 0) return false;
+  const long sh = gpos - epos;                    /* error in units of G: < ecount/2^sh */
+  const cu_limb eu = (sh >= 63 ? 1 : (ecount >> sh) + 1) + 1;
+  /* W[0..N+1] = G, R, H[0..N-1]: the N+2 words starting at bit gpos */
+  const int ws = (int)(gpos>>6), bs = (int)(gpos&63);
+  cu_limb W[N+2];
+  if (bs){
+    for (int i=0;i<N+2;i++){
+      const cu_limb lo = D[ws+i], hi = (ws+i+1 < L) ? D[ws+i+1] : 0;
+      W[i] = (lo>>bs) | (hi<<(64-bs)); }
+  } else for (int i=0;i<N+2;i++) W[i] = D[ws+i];
+  const cu_limb G = W[0];
+  if (G < eu || G > (cu_limb)0 - 1 - eu) return false;
+  r = F::round_make (W+2, F::round_up (W+2, W[1], 1), msb + w0 + 1, sgn);
+  return true;
+}
+
+/* ---------------- two-pass add/sub for a sub-limb alignment (d < 64) ----------------
+ * The common case of cu_sum_round<PB,N>, fused into two passes over the limbs:
+ * (1) align b on the fly and add/subtract into D = [guard, N limbs];
+ * (2) renormalize by the 0/1-bit shift, round and store straight into r.
+ * The RNDN decision needs only the low words, so it is made between the
+ * passes.  With d < 64 nothing of b falls below the guard limb (st = 0), so
+ * a subtraction is exact; a cancellation of two bits or more takes the
+ * general path.  Returns false (r untouched) in that case.               */
+template<int PB> __host__ __device__ CU_FP_HOT_INLINE static inline bool
+cu_addsub_near (cu_freal<PB> &r, const cu_freal<PB> &a, const cu_freal<PB> &b,
+                bool sub, int sgn)
+{
+  typedef cu_freal<PB> F; const int N=F::N;
+  const int bs = (int)(a.exp - b.exp);                /* 0 <= bs < 64 */
+  cu_limb W[N+1], D[N+2];                            /* W, D: [guard, N limbs] */
+  if (bs){
+    W[0]=b.m[0]<<(64-bs);
+    for (int i=1;i<N;i++) W[i]=(b.m[i-1]>>bs)|(b.m[i]<<(64-bs));
+    W[N]=b.m[N-1]>>bs;
+  } else { W[0]=0; for (int i=1;i<=N;i++) W[i]=b.m[i-1]; }
+  r.sign=sgn;
+  if (!sub)
+    {
+      D[0]=W[0];
+      const cu_limb c = cu_add_n<N> (D+1, a.m, W+1);
+      D[N+1]=c;
+      const cu_limb msk=(cu_limb)0-c;                 /* value = D >> c */
+      for (int i=0;i<N;i++) r.m[i] = (D[i+1]>>c) | ((D[i+2]<<63)&msk);
+      r.exp = a.exp+(long)c;
+      r.round_inplace ((D[0]>>c) | ((D[1]<<63)&msk), D[0]&c);
+      return true;
+    }
+  D[0] = (cu_limb)0 - W[0];                           /* guard: 0 - W[0], borrow if W[0] */
+  cu_sub_n<N> (D+1, a.m, W+1, (cu_limb)(W[0]!=0));
+  if (!(D[N]>>62)) return false;                      /* deep cancellation */
+  const cu_limb sh=1-(D[N]>>63), msk=(cu_limb)0-sh;
+  for (int i=0;i<N;i++) r.m[i] = (D[i+1]<<sh) | ((D[i]>>63)&msk);
+  r.exp = a.exp-(long)sh;
+  r.round_inplace (D[0]<<sh, 0);
+  return true;
+}
+
+/* By-value selection only while the objects can live in registers: beyond
+ * CU_FP_DEV_SEL_MAX_LIMBS limbs they are in local memory anyway and copying
+ * them would only add traffic (and compile time), so the plain reference
+ * code is kept there.  Host: always references. */
+#ifndef CU_FP_DEV_SEL_MAX_LIMBS
+#  define CU_FP_DEV_SEL_MAX_LIMBS 128
+#endif
+#if defined(__CUDA_ARCH__)
+#  define CU_FP_SEL_BYVAL(L)  ((L) <= CU_FP_DEV_SEL_MAX_LIMBS)
+#else
+#  define CU_FP_SEL_BYVAL(L)  false
+#endif
+
+/* ---------------- operand selection ----------------
+ * GPU: a reference or pointer that may name either of two register-resident
+ * objects (c ? x : y) forces both into local memory, so the device picks the
+ * operands by value, element by element; the host just takes references. */
+#if defined(__CUDA_ARCH__)
+template<int PB> __device__ __forceinline__ static void   /* hi,lo = c ? (x,y) : (y,x) */
+cu_sel2 (cu_freal<PB> &hi, cu_freal<PB> &lo, bool c, const cu_freal<PB> &x, const cu_freal<PB> &y)
+{
+  hi.sign = c ? x.sign : y.sign;  lo.sign = c ? y.sign : x.sign;
+  hi.exp  = c ? x.exp  : y.exp;   lo.exp  = c ? y.exp  : x.exp;
+#pragma unroll
+  for (int i=0;i<cu_freal<PB>::N;i++){ const cu_limb u=x.m[i], v=y.m[i]; hi.m[i]=c?u:v; lo.m[i]=c?v:u; }
+}
+#  define CU_FP_SELECT2(T,HI,LO,c,x,y)  T HI, LO; cu_sel2 (HI, LO, (c), (x), (y))
+#else
+#  define CU_FP_SELECT2(T,HI,LO,c,x,y)  const T &HI = (c) ? (x) : (y), &LO = (c) ? (y) : (x)
+#endif
+
+/* ---------------- magnitude add: |a|+|b| ---------------- */
+template<int PB> __host__ __device__ static cu_freal<PB>
+cu_addmag_ab (const cu_freal<PB> &a, const cu_freal<PB> &b, int sgn);
+
+template<int PB> __host__ __device__ static cu_freal<PB>
+cu_addmag (const cu_freal<PB> &x, const cu_freal<PB> &y, int sgn)
+{
+  typedef cu_freal<PB> F;
+  if constexpr (CU_FP_SEL_BYVAL(F::N))
+    { CU_FP_SELECT2 (F, a, b, y.exp>x.exp, y, x); return cu_addmag_ab<PB> (a, b, sgn); }
+  else
+    {
+      const F &a = (y.exp>x.exp) ? y : x, &b = (y.exp>x.exp) ? x : y;
+      return cu_addmag_ab<PB> (a, b, sgn);
+    }
+}
+
+/* |a|+|b| with a.exp >= b.exp */
+template<int PB> __host__ __device__ static cu_freal<PB>
+cu_addmag_ab (const cu_freal<PB> &a, const cu_freal<PB> &b, int sgn)
+{
+  typedef cu_freal<PB> F;
+  /* |b| < 2^(a.exp-d) <= ulp(a)/2 strictly: a is the RNDN result */
+  if (a.exp-b.exp > F::P){ F r=a; r.sign=sgn; return r; }
+  if (a.exp-b.exp < 64){ F r; cu_addsub_near<PB> (r, a, b, false, sgn); return r; }
+  return cu_sum_round<PB,F::N> (a.m, a.exp, b.m, b.exp, false, sgn);
 }
 
 /* ---------------- magnitude sub: |a|-|b|, |a|>|b| ---------------- */
 template<int PB> __host__ __device__ static cu_freal<PB>
 cu_submag (const cu_freal<PB> &a, const cu_freal<PB> &b, int sgn)
 {
-  typedef cu_freal<PB> F; const int N=F::N; const int WL=N+2;   /* 128-bit guard */
-  long d = a.exp-b.exp;
-  cu_limb A[WL], B[WL]; cu_limb ext=0;
-  for (int i=0;i<WL;i++){ A[i]=0; B[i]=0; }
-  for (int i=0;i<N;i++) A[i+2]=a.m[i];
-  if (d < WL*64){
-    long ws=d>>6; int bs=(int)(d&63);
-    cu_limb T[WL]; for(int i=0;i<WL;i++) T[i]=0;
-    for (int i=0;i<N;i++) T[i+2]=b.m[i];
-    for (long i=0;i<ws && i<WL;i++) ext |= (T[i]!=0);
-    if (bs && ws<WL) ext |= (T[ws] & (((cu_limb)1<<bs)-1))!=0;
-    for (int i=0;i<WL;i++){ long s=ws+i;
-      cu_limb x=(s<WL)?T[s]:0, y=(s+1<WL)?T[s+1]:0;
-      B[i]= bs? ((x>>bs)|(y<<(64-bs))) : x; }
-  } else ext=1;
-  /* D = A - B  (- borrow if ext, see note in 1024 proto) */
-  cu_limb D[WL]; cu_limb br=0;
-  for (int i=0;i<WL;i++){ cu_limb ai=A[i], bi=B[i]; cu_limb s=ai-bi; cu_limb bb=(ai<bi);
-    cu_limb s2=s-br; bb|=(s<br); D[i]=s2; br=bb; }
-  if (ext){ cu_limb bb=1; for(int i=0;i<WL && bb;i++){ cu_limb s=D[i]-bb; bb=(D[i]<bb); D[i]=s; } }
-  int hl=-1; for (int i=WL-1;i>=0;i--){ if (D[i]){ hl=i; break; } }
-  if (hl<0){ F r; r.set_zero(); return r; }
-  int top=63; { cu_limb v=D[hl]; while(!((v>>top)&1)) top--; }
-  int msb = hl*64+top;
-  long Ehi = a.exp - WL*64 + msb;
-  return F::finalize (D, WL, msb, Ehi, 0, ext, sgn);
+  typedef cu_freal<PB> F;
+  /* |b| < ulp(a)/4 <= half the spacing just below a: rounds back to a */
+  if (a.exp-b.exp > F::P+1){ F r=a; r.sign=sgn; return r; }
+  if (a.exp-b.exp < 64){ F r; if (cu_addsub_near<PB> (r, a, b, true, sgn)) return r; }
+  return cu_sum_round<PB,F::N> (a.m, a.exp, b.m, b.exp, true, sgn);
 }
 
 /* ---------------- add / sub ---------------- */
@@ -285,7 +1128,10 @@ cu_fadd (const cu_freal<PB> &a, const cu_freal<PB> &b)
   if (a.sign==b.sign) return cu_addmag<PB>(a,b,a.sign);
   int c = cu_cmpmag<PB>(a,b);
   if (c==0){ cu_freal<PB> r; r.set_zero(); return r; }
-  return (c>0)? cu_submag<PB>(a,b,a.sign) : cu_submag<PB>(b,a,b.sign);
+  if constexpr (CU_FP_SEL_BYVAL(cu_freal<PB>::N))
+    { CU_FP_SELECT2 (cu_freal<PB>, x, y, c>0, a, b); return cu_submag<PB>(x,y,x.sign); }
+  else
+    return (c>0)? cu_submag<PB>(a,b,a.sign) : cu_submag<PB>(b,a,b.sign);
 }
 template<int PB> __host__ __device__ static cu_freal<PB>
 cu_fsub (const cu_freal<PB> &a, cu_freal<PB> b)

@@ -39,6 +39,9 @@ GPU スレッドがそれぞれ独自の任意精度計算を行えます。す�
 * C++ コンパイラ（`g++`）と `nm`（binutils）。
 * 同梱の上流ソース `gmp-6.3.0/mini-gmp`、`mpfr-4.2.2/src`、`mpc-1.4.1/src`
   （配布物に含まれています。`--with-*-src` で上書きできます）。
+* **CPU のみ：** CUDA Toolkit がない場合（または `--without-cuda` 指定時）は C++17 コンパイラ
+  だけで足ります。ビルドはヘッダオンリーの固定精度ホスト部分（`mpc_cuda_host.h`、8.2 節）に
+  限られます。その `make check` にはシステムの GMP/MPFR/MPC とヘッダが必要です。Python は不要です。
 * 任意：**システムの** `libgmp`/`libmpfr`/`libmpc` とその開発ヘッダ
   （`<mpfr.h>`、`<mpc.h>`）— `make coexist` / `make cputest` / `make cpubench` の場合のみ
   必要です。これらは GPU 移植を CPU ライブラリと照合します。
@@ -449,21 +452,6 @@ API は上流の GMP/MPFR/MPC API に `cu_` プレフィックスを付けたも
   複素初等関数 `cu_mpc_sqrt`、`exp`、`log`、`sin`、`cos`、`tan`、`sinh`、`cosh`、`asin`、
   `acos`、`atan`、…
 
-**丸めモード。** 実行時の `cu_mpfr` / `cu_mpc` API は、**上流の MPFR / MPC とまったく同じ
-丸めモードの意味論** を持ちます。すなわち各演算は明示的な丸めモード引数を取り、同じ三値
-（ternary）を返します。`cu_mpfr_rnd_t` 列挙は `mpfr_rnd_t` と値単位で一致します — `CU_MPFR_RNDN`
-（=0、最近接・偶数丸め）、`CU_MPFR_RNDZ`（0 方向）、`CU_MPFR_RNDU`（+∞ 方向）、`CU_MPFR_RNDD`
-（−∞ 方向）、`CU_MPFR_RNDA`（0 から離れる方向）、`CU_MPFR_RNDF`（faithful）。`cu_mpc_rnd_t` も
-MPC と同様に実部・虚部のモードを 1 つに詰め込み、`CU_MPC_RNDNN … CU_MPC_RNDAA` の全組み合わせと
-`CU_MPC_RND(re,im)` / `CU_MPC_RND_RE` / `CU_MPC_RND_IM` の補助マクロを備えます。CPU とまったく
-同じように呼び出しごとにモードを選びます。（`cu_compat.h` 経由ではこれらを素の `MPFR_RNDN` /
-`MPC_RNDNN` の綴りでも参照できます。）
-
-対照的に、**固定精度** の型（`cu_freal<PB>` / `cu_fcomplex<PB>`、§8.1）は **最近接偶数丸め
-（RNDN）専用** で、丸めモード引数を **取りません**。各演算は `PB` ビットで RNDN に丸めます
-（複素数型は各成分を RNDN、すなわち `MPC_RNDNN` で丸めます）。方向丸め（directed rounding）が
-必要な場合は実行時の `cu_mpfr` / `cu_mpc` API を使ってください。
-
 **デバイスで正しい除算。** MPFR の汎用除算パスは `nvcc` の下で誤コンパイルされます（最適化器が
 3 limb 以上の精度で `inf` を生成します）。mpc_cuda は、（正しさを検証済みの）`mpz` プリミティブ
 の上に構築した、自己完結的で正しく丸められる `mpfr_div` を代わりに使います。これはホストの
@@ -577,6 +565,50 @@ MPFR/MPC と ≤ ~1 ULP で一致** します — 検証スイートにわたり
 > `cudaDeviceSetLimit` の戻り値を必ず確認してください。
 
 ---
+
+### 8.2 ホスト（CPU）での利用・チューニング・融合演算
+
+`cu_freal`/`cu_fcomplex` はヘッダオンリーで、C++17 のホストコンパイラでそのまま使えます。ホスト
+側の経路はデバイス側とは別に最適化されており（デバイスのコードは変更なし）、**MPFR/MPC の RNDN と
+ビット単位で一致** します。
+
+* **乗算** は積の N−3 列目より下を計算しません（mulhigh、計算量は約半分）。省いた部分は丸め語の
+  1 つ下の語の N 単位未満なので、その語が桁あふれまで 2N 以内のとき、またはちょうど同点で 0 の
+  ときだけ完全積で計算し直します。
+* **複素数乗算** は、同じ誤差判定つきの切り捨て積（N < 8）か、固定小数点の共通フレームでの
+  3 回乗算 Karatsuba（N ≥ 8）を使い、どちらも厳密計算へのフォールバックを持ちます。
+* **融合演算（正しく丸められる）**（`#include "mpc_cuda/cu_ffused.cuh"`、ホスト専用、アンブレラ
+  からも取り込まれます）：`cu_ffma_cr(a,b,c)`、`cu_fdot(x,y,n)`、`cu_cfma_cr(a,b,c)`、`cu_cdot(x,y,n)`。
+  結果ごとに 1 回だけ丸め、`mpfr_fma`、`mpfr_dot`、`mpc_fma`、`mpc_dot`（`MPC_RNDNN`）と一致します。
+  無印の `cu_ffma`/`cu_cfma` は高速な乗算+加算（丸め 2 回、MPFR/MPC の mul→add とビット一致）です。
+  内積は切り捨て積を誤差上限つきの固定小数点アキュムレータに足し込み、丸めを保証できない場合は
+  厳密に計算し直します（積の指数範囲に比例するヒープメモリを使います）。
+
+ビルド時のスイッチ（すべて任意）：
+
+| マクロ | 効果 |
+|---|---|
+| `CU_FP_NO_ASM` | ホストのインラインアセンブリをすべて無効化（移植性のある `__int128` コードのみ） |
+| `CU_FP_X86_ASM` | 加減算に x86-64 の `adc`/`sbb` ループを使う（オプトイン。先に検証してください） |
+| `CU_FP_HOST_USE_GMP` | N ≥ `CU_FP_GMP_MIN_N`（既定 24）で GMP の `mpn_mul_n` を使う。`-lgmp` をリンク |
+| `CU_FP_MULHIGH_MIN_N` (6)、`CU_FP_CMUL_FAST_MIN_N` (4)、`CU_FP_CKARA_MIN_N` (8)、`CU_FP_OPSCAN_MAX_N` (22) | 切り替え点（limb 数） |
+
+CUDA がない環境では `--without-cuda` で configure します（`nvcc` が見つからなければ自動）。
+`make` / `make check` / `make install` はこのホスト部分だけを対象にし、`#include "mpc_cuda_host.h"`
+で g++ からすべて使えます。
+
+手元のマシンでの検証と計測：
+
+```
+make check-fixed-host                       # MPFR/MPC とのビット一致（fma/dot を含む）
+make bench-host-fixed FLINT_PREFIX=/path BENCH_PIN="taskset -c 5"
+tools/tune_host_fixed.sh                    # configure/CUDA 不要。各ビルド構成を試し、
+                                            # ビット一致しない構成は除外して計測
+```
+
+GB10（Cortex-X925 コア 1 つ）で FLINT 3.6 の `nfloat`（正しく丸められない）と比べると、乗算は
+64 bit で 3.4 倍速く、384 bit まで同等以上、512〜2048 bit で 0.8〜0.9 倍、複素数乗算は 0.5〜0.8 倍
+です。`-march=native` を付けてください。
 
 ## 9. デモとベンチマーク
 

@@ -1,3 +1,92 @@
+2026-10-04  Tomonori Kouya  <tkouya@gmail.com>
+
+	Release 0.0.2 (continued): x86-64 host and GPU speed of the
+	fixed-precision types (checked on Xeon Gold 6526Y + H100 NVL), still
+	bit-exact with MPFR/MPC.
+
+	* include/mpc_cuda/cu_freal.cuh: x86-64 BMI2+ADX multiply kernel
+	(mulx with adcx/adox carry chains, offsets as assembler symbols):
+	fully unrolled up to CU_FP_X86_UNROLL_MAX_N (33) limbs, bit-identical
+	to the generic kernel; above that rows padded to quads and grouped by
+	length (keeps the mulhigh error bound).  Used from 4 limbs
+	(CU_FP_X86_MULX_MIN_N).  cu_add_n/cu_sub_n: straight-line adc/sbb
+	chain on x86-64 by default from 4 limbs (CU_FP_X86_ADC_MIN_N; replaces
+	the opt-in CU_FP_X86_ASM loop).
+	Device: cu_mul_cols kernel (32-bit comba with fused mad.lo.cc/madc.hi.cc,
+	any start column), cu_fmul mulhigh on the GPU for 256..2048-bit;
+	operands picked by value instead of by a conditional reference
+	(cu_sel2 / CU_FP_SELECT2, up to CU_FP_DEV_SEL_MAX_LIMBS = 128 limbs),
+	which kept both operands in local memory;
+	the runtime-shift normalization of a deep cancellation works on a copy.
+	Even limb counts are 16-byte aligned (128-bit loads, size unchanged).
+	* include/mpc_cuda/cu_fcomplex.cuh: cu_fmmas_short, a branch-free
+	fixed-point a*b +- c*d for short operands (host N <= 2, device
+	N <= 32); truncated-product path usable on the device (off by
+	default); by-value operand selection on the device; finalize() gets a
+	copy of a wide term.
+	* include/mpc_cuda/cu_ffused.cuh: cu_dot_core adds/subtracts each
+	term branch-free and places the shifted product without branching on
+	the bit offset.
+	* include/mpc_cuda/cu_fwarp.cuh (new, included by mpc_cuda.cuh):
+	cu_warp_load / cu_warp_store, warp-cooperative coalesced transfer of
+	arrays of the fixed-precision types through a per-warp shared-memory
+	buffer of 32 elements (cu_fwarp_buf; dynamic: cu_fwarp_dyn,
+	cu_fwarp_prepare), 16-byte words for 16-byte-aligned types.
+	* tools/fixed_testgen.h (new, from test_freal_host.cpp),
+	tools/test_fixed_gpu.cu (new): device vs host on rounding corner
+	cases, and cu_fwarp transfers (partial tiles, sentinels past n); Makefile targets check-fixed-gpu (run by check-fixed) and
+	check-fixed-host now also with -march=native.
+	* tools/bench_gpu_fixed.cu, tools/bench_gpu_fixed_cpu.cpp,
+	tools/bench_gpu_fixed.h (new): GPU vs all CPU cores (cu_freal host,
+	FLINT nfloat), each operation also with cu_fwarp transfers;
+	Makefile target bench-gpu-fixed.
+	* tools/bench_host_fixed.cpp: the three libraries timed in interleaved
+	rounds; warm-up before the first rows.
+	* tools/tune_host_fixed.sh: variants default/noasm/gmp; note on FLINT
+	builds without ADX assembly.
+
+2026-10-04  Tomonori Kouya  <tkouya@gmail.com>
+
+	Release 0.0.2 (continued): host (CPU) speed of the fixed-precision types.
+
+	* include/mpc_cuda/cu_freal.cuh: branch-free RNDN rounding and 0/1-bit
+	  renormalization (round_up, round_make, round_inplace); cu_sum_round
+	  (add/sub of normalized multi-limb terms, optional error-window check);
+	  fused two-pass cu_addsub_near; cu_add_n/cu_sub_n (aarch64 adcs/sbcs,
+	  opt-in x86-64 adc/sbb); host multiply kernels cu_mul_cols<N,K>
+	  (mulhigh by dropping columns < K) with size-dependent shapes and an
+	  optional GMP kernel; host cu_fmul as a mulhigh with exact fallback;
+	  cu_round_fixed (round an approximate fixed-point value with an error
+	  bound).  Device paths unchanged.
+	* include/mpc_cuda/cu_fcomplex.cuh: host truncated-product fmma/fmms
+	  with an error-window test, and a fixed-point Karatsuba complex
+	  multiply, both with exact fallback.
+	* include/mpc_cuda/cu_ffused.cuh (new): correctly rounded cu_ffma_cr,
+	  cu_fdot, cu_cfma_cr, cu_cdot, and the fast mul+add cu_ffma,
+	  cu_cfma; included from mpc_cuda.cuh.
+	* configure.ac, Makefile.in, mpc_cuda.pc.in: CUDA optional; CPU-only
+	  mode (--without-cuda or no nvcc) with targets host, check-host,
+	  check-fmath-host, sample-fixed-host, install-host.
+	* include/mpc_cuda_host.h, demos/sample_fixed_host.cpp,
+	  tools/cuda_host_shim.h (new); tools/test_f*math*.cu also build as C++.
+	* tools/test_freal_host.cpp, tools/bench_host_fixed.cpp,
+	  tools/tune_host_fixed.sh (new); Makefile targets check-fixed-host and
+	  bench-host-fixed.
+
+2026-07-02  Tomonori Kouya  <tkouya@gmail.com>
+
+	Release 0.0.2.
+
+	* src/cuda_minigmp.cu (cu_mpn_mul): dispatch equal-size device multiplies
+	  of 4..32 limbs to a new register-resident, fully-unrolled 32-bit
+	  product-scanning (comba) base multiply (cu_mpn_mul_comba32<N>), which
+	  keeps the whole product in registers and streams it to the destination
+	  instead of accumulating through the global-memory arena with a runtime
+	  limb count.  4.4x-24.5x faster for 512..2048-bit on H100 (sm_90),
+	  bit-identical to the previous path; guarded by CU_MPN_MUL_NO_COMBA.
+	* tests/test_combamul.cu, tests/test_combaperf.cu: correctness and
+	  throughput tests for the new base multiply.
+
 2026-06-05  Tomonori Kouya  <tkouya@gmail.com>
 
 	Release 0.0.1.

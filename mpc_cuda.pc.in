@@ -29,5 +29,5 @@ legacy_cflags=-I${includedir}/mpc_cuda/mpfr -I${includedir}/mpc_cuda/mpc
 # device link for you.  The shared libmpc_cuda.so exposes the host-callable cu_*
 # API for host-only consumers.
 archive=${libdir}/libmpc_cuda.a
-Libs: -L${libdir} -lmpc_cuda
-Libs.private: -lcudart
+Libs: @PC_LIBS@
+Libs.private: @PC_LIBS_PRIVATE@

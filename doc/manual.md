@@ -38,6 +38,10 @@ re-generated against future upstream releases.
 * A C++ compiler (`g++`) and `nm` (binutils).
 * The bundled upstream sources `gmp-6.3.0/mini-gmp`, `mpfr-4.2.2/src`,
   `mpc-1.4.1/src` (shipped in the distribution; override with `--with-*-src`).
+* **CPU only:** without the CUDA Toolkit (or with `--without-cuda`) only a C++17
+  compiler is required; the build then covers the header-only fixed-precision
+  host part (`mpc_cuda_host.h`, section 8.2). `make check` there needs the system
+  GMP/MPFR/MPC with headers; Python is not needed.
 * Optional: the **system** `libgmp`/`libmpfr`/`libmpc` and their development
   headers (`<mpfr.h>`, `<mpc.h>`) — only for `make coexist` / `make cputest` /
   `make cpubench`, which check the GPU port against the CPU libraries.
@@ -454,24 +458,6 @@ The API is the upstream GMP/MPFR/MPC API with the `cu_` prefix. Notable points:
   and complex elementary functions `cu_mpc_sqrt`, `exp`, `log`, `sin`, `cos`,
   `tan`, `sinh`, `cosh`, `asin`, `acos`, `atan`, …
 
-**Rounding modes.** The runtime `cu_mpfr` / `cu_mpc` API uses **exactly the same
-rounding-mode semantics as upstream MPFR / MPC**: every operation takes an
-explicit rounding-mode argument and returns the same ternary value. The
-`cu_mpfr_rnd_t` enum mirrors `mpfr_rnd_t` value-for-value — `CU_MPFR_RNDN` (=0,
-nearest, ties to even), `CU_MPFR_RNDZ` (toward zero), `CU_MPFR_RNDU` (toward
-+∞), `CU_MPFR_RNDD` (toward −∞), `CU_MPFR_RNDA` (away from zero), `CU_MPFR_RNDF`
-(faithful) — and `cu_mpc_rnd_t` packs a real and an imaginary mode just like
-MPC, with all combinations `CU_MPC_RNDNN … CU_MPC_RNDAA` and the
-`CU_MPC_RND(re,im)` / `CU_MPC_RND_RE` / `CU_MPC_RND_IM` helpers. You select the
-mode per call exactly as on the CPU. (Via `cu_compat.h` these are also reachable
-under the plain `MPFR_RNDN` / `MPC_RNDNN` spellings.)
-
-In contrast, the **fixed-precision** types (`cu_freal<PB>` / `cu_fcomplex<PB>`,
-§8.1) are **round-to-nearest-even (RNDN) only** and take **no** rounding-mode
-argument: every operation rounds RNDN at `PB` bits (the complex type rounds each
-component RNDN, i.e. `MPC_RNDNN`). If you need a directed rounding mode, use the
-runtime `cu_mpfr` / `cu_mpc` API.
-
 **Device-correct division.** MPFR's generic division path miscompiles under
 `nvcc` (the optimizer produces `inf` for ≥ 3-limb precision). mpc_cuda substitutes
 a self-contained, correctly-rounded `mpfr_div` built on the (verified-correct)
@@ -539,9 +525,72 @@ products (a register-resident `fmms`/`fmma`, no double rounding), so it is
 1024-bit, complex AXPY `z = a·x + y` runs ~**67×** faster than the runtime
 `cu_mpc` GPU path (bit-identical).
 
+**On the GPU** the multiply is a fully unrolled 32-bit product-scanning
+(comba) kernel with fused `mad.lo.cc`/`madc.hi.cc`, keeping only the product
+columns ≥ N−3 (the host's "mulhigh" with its error bound and exact fallback)
+for 256–2048 bits; the complex multiply combines the two exact products of
+each component in one fixed-point frame without branching on signs (up to
+2048 bits). Two GPU-specific rules shape the code: operands are chosen *by
+value* (`cu_sel2`), never through a conditional reference such as
+`c ? x : y`, which would force both objects into local memory; and no
+register-resident array is indexed with a runtime offset (rare paths work
+on a copy). On an H100 this made, compute-bound, `add` 1.5–2.9×, complex
+multiply 3.3–9× and multiply up to 1.8× faster than before (64–2048 bits).
+
+`make bench-gpu-fixed FLINT_PREFIX=…` runs element-wise kernels over arrays of
+`cu_freal`/`cu_fcomplex` against the same operations on all CPU cores (this
+library's host path and FLINT `nfloat`, OpenMP). H100 NVL vs 32 Xeon Gold 6526Y
+cores: 10–28× faster than `nfloat` for real operations and 4.3–27× for complex
+ones up to 1024 bits, 2.6–14× at 2048 bits, 1–3× at 4096 bits. Even limb
+counts are 16-byte aligned so that 128-bit accesses are possible.
+
+**Coalesced array access — `mpc_cuda/cu_fwarp.cuh`** (also in the umbrella).
+An array of `cu_freal`/`cu_fcomplex` read one element per thread is accessed
+with 8/16-byte loads at a stride of 16+8N bytes, which caps streaming
+bandwidth (~1–1.6 TB/s on an H100 against ~3.3 TB/s for coalesced access).
+`cu_warp_load`/`cu_warp_store` let a warp move its 32 consecutive elements as
+one contiguous block of 16-byte words through a per-warp shared-memory buffer:
+
+```cpp
+#include "mpc_cuda.cuh"
+using namespace cu_fp;
+typedef cu_freal<1024> F;
+constexpr int TPB = 128;
+
+__global__ void axpy(long n, F a, const F *x, const F *y, F *r) {
+  __shared__ cu_fwarp_buf<F, TPB/32> buf;            // 32 elements per warp
+  F *wb = buf.warp();
+  for (long base = cu_warp_first_tile(); base < n; base += cu_warp_tile_stride()) {
+    F xi = cu_warp_load(x, base, n, wb), yi = cu_warp_load(y, base, n, wb);
+    cu_warp_store(r, base, n, cu_fadd<1024>(cu_fmul<1024>(a, xi), yi), wb);
+  }
+}
+```
+
+* All 32 lanes call each function with the same (warp-uniform) `base`; lane
+  *l* handles element `base+l`; past `n` the load is unspecified and the store
+  skipped, so `n` need not be a multiple of 32.
+* The buffer is `cu_fwarp_bytes<T>()` = 32·sizeof(T) per warp (4.6 KB at
+  1024-bit real, 17 KB at 2048-bit complex). Static `__shared__` storage is
+  limited to 48 KB per block; for larger types use dynamic shared memory:
+  `T *wb = cu_fwarp_dyn<T>();` in the kernel and
+  `size_t sm = cu_fwarp_prepare<T>(kernel, TPB); kernel<<<g, TPB, sm>>>(…)`
+  on the host (it raises the kernel's dynamic-shared-memory limit). The
+  dynamic buffer starts at offset 0 of the block's dynamic shared memory.
+* It pays off where the kernel is memory-bound. H100 NVL, 2²⁰ elements
+  (`make bench-gpu-fixed`, columns GPU vs warp): real `mul`/`add` 1.24–1.68×
+  faster from 128 to 2048 bits, axpy 1.55× at 2048 bits, complex multiply
+  1.25–1.54× at 128 and 512 bits. Arithmetic-bound kernels gain nothing or
+  lose a little: complex at ≥ 2048 bits 0.9×, and at 4096 bits the 135 KB of
+  staging per 128-thread block halves the occupancy (complex 0.5–0.7×; use
+  smaller blocks or the plain access there). Results are bit-identical
+  either way (`make check-fixed-gpu` covers partial tiles, both word widths,
+  static and dynamic buffers).
+
 `make sample-fixed` builds and runs `demos/sample_fixed.cu` (real **and**
 complex, header-only, just `-Iinclude`); `make check-fixed` validates both
-`cu_freal` and `cu_fcomplex` bit-exact against the system MPFR/MPC.
+`cu_freal` and `cu_fcomplex` bit-exact against the system MPFR/MPC, and the
+device against the host path on rounding corner cases (`check-fixed-gpu`).
 
 **Fixed-precision elementary functions** (`mpc_cuda/cu_fmath.cuh`,
 `cu_fcmath.cuh`, also pulled in by the umbrella). High-accuracy (NOT
@@ -593,6 +642,76 @@ vs CPU MPC) follows the same shape, with an even larger fixed-precision lead
 > return value of `cudaDeviceSetLimit`.
 
 ---
+
+### 8.2 Host (CPU) use, tuning and fused operations
+
+`cu_freal`/`cu_fcomplex` are header-only and compile with any C++17 host
+compiler; the host path is tuned separately from the device path and remains
+**bit-exact with MPFR/MPC RNDN**:
+
+* **Multiply** drops the product columns below N−3 ("mulhigh", ~half the work).
+  The dropped part is < N units of the word below the round word, so the result
+  is exact unless that word is within 2N of overflow, or zero on an exact tie;
+  only then is the full product recomputed. Kernels: on x86-64 with BMI2+ADX
+  (`-march=native` on Broadwell or later, Zen) `mulx` with two independent
+  carry chains (`adcx`/`adox`), fully unrolled up to 33 limbs and row-grouped
+  above; on aarch64 `adcs` chains; elsewhere `__int128` C.
+* **Complex multiply**: for 1–2 limbs a branch-free fixed-point a·b ± c·d from
+  the exact products (1.26× FLINT's `nfloat` at 64 bits); truncated products with the same kind of error window
+  (3 ≤ N < 8); a 3-multiplication Karatsuba in one fixed-point frame (N ≥ 8);
+  all with an exact fallback.
+* **Fused, correctly-rounded operations** (`#include "mpc_cuda/cu_ffused.cuh"`,
+  host only, also via the umbrella): `cu_ffma_cr(a,b,c)`, `cu_fdot(x,y,n)`,
+  `cu_cfma_cr(a,b,c)`, `cu_cdot(x,y,n)` — one rounding per result, equal to
+  `mpfr_fma`, `mpfr_dot`, `mpc_fma`, `mpc_dot` (`MPC_RNDNN`). The plain `cu_ffma`/`cu_cfma`
+  are the faster two-rounding `mul`+`add` (bit-exact with MPFR/MPC `mul` then `add`). The dot products
+  accumulate truncated products in a fixed-point accumulator with an error bound;
+  if the rounding cannot be certified they redo the sum exactly (heap memory
+  proportional to the exponent span of the products).
+
+Build-time switches (all optional):
+
+| macro | effect |
+|---|---|
+| `CU_FP_NO_ASM` | disable all host inline asm (portable `__int128` code only) |
+| `CU_FP_NO_X86_MULX` | keep the x86-64 `adc`/`sbb` add chains but not the `mulx`/`adx` multiply |
+| `CU_FP_HOST_USE_GMP` | use GMP `mpn_mul_n` for N ≥ `CU_FP_GMP_MIN_N` (default 24); link `-lgmp` |
+| `CU_FP_MULHIGH_MIN_N` (6), `CU_FP_CMUL_FAST_MIN_N` (4), `CU_FP_CKARA_MIN_N` (8), `CU_FP_OPSCAN_MAX_N` (22), `CU_FP_CSHORT_MAX_N` (2) | host crossover points, in limbs |
+| `CU_FP_X86_MULX_MIN_N` (4), `CU_FP_X86_UNROLL_MAX_N` (33), `CU_FP_X86_ADC_MIN_N` (4) | x86-64: smallest N for the `mulx` kernel; largest fully unrolled N; shortest asm `adc`/`sbb` chain |
+| `CU_FP_DEV_MULHIGH_MIN_N` (4), `CU_FP_DEV_MULHIGH_MAX_N` (32), `CU_FP_DEV_CSHORT_MAX_N` (32), `CU_FP_DEV_CMUL_FAST_MIN_N` (off) | device crossover points, in limbs |
+
+Without CUDA, configure with `--without-cuda` (automatic when `nvcc` is
+missing): `make` / `make check` / `make install` then cover exactly this host
+part, and `#include "mpc_cuda_host.h"` pulls in all of it with plain `g++`.
+
+Validate and measure on your machine:
+
+```
+make check-fixed-host                       # bit-exact vs MPFR/MPC (incl. fma/dot)
+make bench-host-fixed FLINT_PREFIX=/path BENCH_PIN="taskset -c 5"
+tools/tune_host_fixed.sh                    # no configure/CUDA needed; tries the
+                                            # variants, rejects any that is not bit-exact
+```
+
+Compared with FLINT 3.6 `nfloat` (which is not correctly rounded), one core,
+65536 random full-precision operands per vector (`make bench-host-fixed`):
+
+| | GB10, Cortex-X925 | Xeon Gold 6526Y (x86-64) |
+|---|---|---|
+| real multiply | 3.4× at 64 bits, ≥1× up to 384, 0.8–0.9× at 512–2048 | 3.9× / 2.4× / 1.5× / 1.07× at 64 / 128 / 192 / 256 bits, 0.73× at 384–512, 0.82–1.03× at 768–4096 |
+| complex multiply | 0.5–0.8× | 1.26× at 64 bits, 0.44–0.55× at 128–384, 0.77–1.06× at 512–4096 |
+| add | — | 1.3× at 64 bits, 0.85–1.23× above |
+| correctly rounded dot (`cu_fdot`) | — | 0.58–0.64× up to 256 bits, 0.87–1.09× above |
+| axpy / dot as mul+add, `cu_ffma_cr` (≤ 256 bits) | — | 0.16–0.5× (`nfloat`'s fused vector kernels) |
+
+Use `-march=native`. On x86-64 the comparison is against a FLINT (and GMP)
+built **with** its ADX assembly (`FLINT_HAVE_ASSEMBLY_x86_64_adx` in
+`flint-config.h`): GMP 6.3/FLINT 3.6's `configure` may misdetect a newer CPU
+(an Emerald Rapids Xeon came out as `nehalem`), giving a build without it in
+which `nfloat` is up to ~1.6× slower; configure them with an explicit
+`--host=` (e.g. `icelake-pc-linux-gnu` for GMP, `icelake_server-pc-linux-gnu`
+for FLINT) in that case. Against MPFR/MPC the fixed types are 1.1–15× faster
+at every size.
 
 ## 9. Demos and benchmarks
 
