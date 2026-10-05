@@ -1,3 +1,10 @@
+2026-10-05  Tomonori Kouya  <tkouya@gmail.com>
+
+	* tools/bench_gpu_fixed.cu: skip the warp-staged variant ("n/a") when
+	cu_fwarp_prepare cannot provide its shared memory, instead of launching
+	with none (illegal memory access for 4096-bit complex on a GB10, whose
+	99 KB per block is below the 132 KB of 4 warps x 32 elements).
+
 2026-10-04  Tomonori Kouya  <tkouya@gmail.com>
 
 	Release 0.0.2 (continued): x86-64 host and GPU speed of the

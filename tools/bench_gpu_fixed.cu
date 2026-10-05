@@ -11,7 +11,9 @@
  *          -DBG_OPMASK=bits of {mul,add,axpy,cmul,caxpy}, -DBG_PBMAX=bits.
  * Each operation runs twice: plain (each thread reads its element, 8/16 bytes
  * at a 16+8N-byte stride, ~1-1.6 TB/s on an H100) and warp-staged (coalesced
- * tiles through shared memory with cu_warp_load/cu_warp_store). */
+ * tiles through shared memory with cu_warp_load/cu_warp_store).  The warp
+ * variant is skipped ("n/a") when its buffer, 32 elements per warp, exceeds the
+ * device's shared memory per block (e.g. 4096-bit complex on a GB10, 99 KB). */
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -112,6 +114,7 @@ template<int PB> static void bench (int nsm, bool docpu)
     cudaMemset(dr,0,B);
     switch (op){
 #define LAUNCHW(BL, TG, T, K, ...) { const size_t sm = cu_fwarp_prepare<T> (K, TPB); \
+      if (sm == 0) break;      /* buffer exceeds the device's shared memory */ \
       cudaOccupancyMaxActiveBlocksPerMultiprocessor(&BL, K, TPB, sm); \
       int g=BL*nsm; if ((long)g*TPB > n) g=(n+TPB-1)/TPB; \
       TG=gtime([&]{ K<<<g,TPB,sm>>>(__VA_ARGS__); }, n); }
@@ -121,9 +124,11 @@ template<int PB> static void bench (int nsm, bool docpu)
     case 3: if constexpr ((OPMASK>>3)&1) LAUNCHW(blw,tw,C,kw_cmul<PB>, n,(C*)dx,(C*)dy,(C*)dr); break;
     case 4: if constexpr ((OPMASK>>4)&1) LAUNCHW(blw,tw,C,kw_caxpy<PB>, n,ca,(C*)dx,(C*)dy,(C*)dr); break;
     }
-    cudaMemcpy(rw.data(),dr,B,cudaMemcpyDeviceToHost);
     long badw=0;                       /* warp-staged == plain, every element */
-    for (long i=0;i<(op>=3?2*n:n);i++) badw += !same<PB>(r[i],rw[i]);
+    if (tw > 0){
+      cudaMemcpy(rw.data(),dr,B,cudaMemcpyDeviceToHost);
+      for (long i=0;i<(op>=3?2*n:n);i++) badw += !same<PB>(r[i],rw[i]);
+    }
     long bad=0; const long step=  (op>=3? n/2048 : n/4096) + 1;
     for (long i=0;i<n;i+=step){
       if (op<3){ F h = op==0? cu_fmul<PB>(x[i],y[i]) : op==1? cu_fadd<PB>(x[i],y[i]) : cu_fadd<PB>(cu_fmul<PB>(a,x[i]),y[i]);
@@ -133,12 +138,15 @@ template<int PB> static void bench (int nsm, bool docpu)
         bad += !same<PB>(h.re,cr[i].re) + !same<PB>(h.im,cr[i].im); }
     }
     double tc=0, tn=0; if (docpu) bg_cpu_times(PB, M, op, &tc, &tn);
-    const double tb = tw < tg ? tw : tg;
+    const double tb = (tw > 0 && tw < tg) ? tw : tg;
+    char ws[40];                       /* warp column; n/a when it did not fit */
+    if (tw > 0) snprintf (ws, sizeof ws, "%8.3f ns (%4.2fx)", tw, tg/tw);
+    else        snprintf (ws, sizeof ws, "     n/a ns (  -  )");
     if (docpu)
-      printf("%5d %-6s GPU %8.3f warp %8.3f ns (%4.2fx) | CPU-all cu %8.3f  nfloat %8.3f ns | GPU/nf %6.1fx  cu/nf %5.2fx %s\n",
-             PB, opn[op], tg, tw, tg/tw, tc, tn, tn/tb, tn/tc, (bad||badw)? "MISMATCH":"exact");
+      printf("%5d %-6s GPU %8.3f warp %s | CPU-all cu %8.3f  nfloat %8.3f ns | GPU/nf %6.1fx  cu/nf %5.2fx %s\n",
+             PB, opn[op], tg, ws, tc, tn, tn/tb, tn/tc, (bad||badw)? "MISMATCH":"exact");
     else
-      printf("%5d %-6s GPU %8.3f warp %8.3f ns (%4.2fx)  occ %d/%d  %s\n", PB, opn[op], tg, tw, tg/tw, bl, blw,
+      printf("%5d %-6s GPU %8.3f warp %s  occ %d/%d  %s\n", PB, opn[op], tg, ws, bl, blw,
              (bad||badw)? "MISMATCH":"exact");
     fflush(stdout);
   }
