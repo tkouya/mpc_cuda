@@ -52,6 +52,7 @@
  * csqrt,csin,ccos,ctan,csinh,ccosh}.  Header-only templates; fastest at low/
  * medium precision.  (Real/complex special functions are future work.) */
 #include "mpc_cuda/cu_fmath.cuh"
+#include "mpc_cuda/cu_fround.cuh"
 #include "mpc_cuda/cu_fcmath.cuh"
 
 #endif /* MPC_CUDA_UMBRELLA_CUH */

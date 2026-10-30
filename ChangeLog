@@ -1,3 +1,14 @@
+2026-10-30  NAKATA Maho  <maho.nakata@gmail.com>
+
+	* include/mpc_cuda/cu_fround.cuh: New.  Correctly rounded (RNDN)
+	cu_fp::cu_fdiv_rn and cu_fp::cu_sqrt_rn for cu_freal<PB>: Newton at
+	PB+64 bits, exact integer decision near a rounding midpoint.
+	* include/mpc_cuda.cuh: Include it.
+	* Makefile.in (install): Install it.
+	(check-fixed): Build and run tools/test_fround.cu.
+	* tools/test_fround.cu: New.  GPU test against mpfr_div / mpfr_sqrt.
+	* doc/manual.md, doc/manual.ja.md: Document the new functions.
+
 2026-06-05  Tomonori Kouya  <tkouya@gmail.com>
 
 	Release 0.0.1.

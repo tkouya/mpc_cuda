@@ -561,9 +561,34 @@ range — empirically **0 ULP** over the validation suite (`make check-fmath`,
 `PB` = 64…1024). It is deliberately **not** correctly-rounded: the
 table-maker's-dilemma cases would need an unbounded Ziv loop, incompatible with
 register-resident fixed precision. Use the runtime `cu_mpfr`/`cu_mpc` API when
-last-bit correct rounding is required. Real/complex **special** functions
+last-bit correct rounding is required (except for real division and square
+root, see below). Real/complex **special** functions
 (gamma, zeta, erf, Bessel, …) are future work. Fastest at low/medium precision
 (values stay in registers); at very high `PB` the working set spills.
+
+**Correctly rounded division and square root** (`mpc_cuda/cu_fround.cuh`,
+also pulled in by the umbrella). For these two operations the table-maker's
+dilemma has a bounded exact answer, so they are provided correctly rounded:
+
+```cuda
+template<int PB> __host__ __device__ int cu_fp::cu_fdiv_rn(cu_freal<PB>& q, const cu_freal<PB>& a, const cu_freal<PB>& b);
+template<int PB> __host__ __device__ int cu_fp::cu_sqrt_rn(cu_freal<PB>& r, const cu_freal<PB>& a);
+```
+
+The result is `a/b` or `sqrt(a)` rounded to nearest, ties to even (RNDN), bit
+for bit what `mpfr_div` / `mpfr_sqrt` return at precision `PB` (for exponents
+inside MPFR's range). They return 0 on success and 1 for a zero divisor or a
+negative argument (the output is then unspecified); the output may alias an
+input; a zero result is +0, as everywhere in `cu_freal`. They compute Newton
+iterations at `W = PB + 64` bits; when the approximation is within 64 W-ulps of
+a `PB` rounding midpoint they decide the side exactly from the sign of
+`a − t·b` (or `a − t²`) with full integer products, `t` being the midpoint. No
+Ziv loop, allocation or global state. The approximate `cu_fdiv`, `cu_sqrt` and
+`operator/` are unchanged. The Newton
+temporaries need more than the default 1 KB device stack (about 4 KB at
+`PB` ≤ 512, 8 KB at ≤ 1024, 16 KB at 2048). `make check-fixed` validates both
+against MPFR at `PB` = 224 (sub-limb), 256, 512, 768, 1024, 2048, including
+operands constructed to fall within one W-ulp of a boundary.
 
 **Where the fixed-precision fast path wins (`make bench3`).** AXPY `r = a·x + y`
 on a GB10, all bit-exact:
@@ -606,7 +631,7 @@ library's own host path; every result is bit-exact). On an NVIDIA GB10, 1024-bit
 | `make matmul-mpfr` / `matmul-mpc` | matrix multiply `C = A·B` | **~105×** |
 | `make bench-mpfr` / `bench-mpc` | per-function elementary/transcendental benchmark | 22–77× |
 | `make sample-fixed` | fixed-precision `cu_freal<PB>` / `cu_fcomplex<PB>` (real + complex) | header-only, bit-exact |
-| `make check-fixed` | validate `cu_freal`/`cu_fcomplex` vs system MPFR/MPC, PB = 32…2048 | all bit-exact |
+| `make check-fixed` | validate `cu_freal`/`cu_fcomplex` (and `cu_fdiv_rn`/`cu_sqrt_rn`) vs system MPFR/MPC, PB = 32…2048 | all bit-exact |
 | `make check-fmath` | ULP accuracy of fixed-precision elementary functions vs MPFR/MPC | ≤1 ULP (0 in suite) |
 | `make bench3` | AXPY 128..8192-bit: GPU `cu_freal` vs GPU `cu_mpfr` vs CPU MPFR | crossover sweep (below) |
 | `make coexist` | `cu_mpfr` (GPU) + system `libmpfr` (CPU) in one binary | π, log 2 agree |

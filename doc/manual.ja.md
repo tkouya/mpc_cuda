@@ -547,9 +547,29 @@ MPFR/MPC と ≤ ~1 ULP で一致** します — 検証スイートにわたり
 （`make check-fmath`、`PB` = 64…1024）。これは意図的に **正しく丸められません**：テーブルメーカー
 のジレンマのケースには無制限の Ziv ループが必要であり、レジスタ常駐の固定精度とは相容れない
 ためです。最後の 1 ビットまで正しい丸めが必要な場合は実行時の `cu_mpfr`/`cu_mpc` API を使って
-ください。実数/複素数の **特殊** 関数（ガンマ、ゼータ、erf、ベッセル、…）は今後の課題です。
+ください(実数の除算と平方根は例外。下記参照)。実数/複素数の **特殊** 関数（ガンマ、ゼータ、erf、ベッセル、…）は今後の課題です。
 低～中精度で最速です（値がレジスタにとどまるため）。非常に高い `PB` ではワーキングセットが
 あふれます。
+
+**正しく丸められる除算と平方根**（`mpc_cuda/cu_fround.cuh`。アンブレラからも取り込まれます）。
+この 2 つの演算ではテーブルメーカーのジレンマが有限の厳密計算で解決できるため、正しく丸めた版を
+提供します。
+
+```cuda
+template<int PB> __host__ __device__ int cu_fp::cu_fdiv_rn(cu_freal<PB>& q, const cu_freal<PB>& a, const cu_freal<PB>& b);
+template<int PB> __host__ __device__ int cu_fp::cu_sqrt_rn(cu_freal<PB>& r, const cu_freal<PB>& a);
+```
+
+結果は `a/b` または `sqrt(a)` を最近接偶数丸め（RNDN）したもので、精度 `PB` の `mpfr_div` /
+`mpfr_sqrt` とビット単位で一致します（指数が MPFR の範囲内の場合）。戻り値は成功で 0、除数 0
+または負の引数で 1（その場合の出力は不定）。出力は入力と同じ変数でもかまいません。結果のゼロは
+`cu_freal` の他の演算と同じく +0 です。`W = PB + 64` ビットでニュートン反復を行い、近似値が
+`PB` の丸めの中点から 64 W-ulp 以内にある場合だけ、中点 `t` について `a − t·b`（または `a − t²`）
+の符号を完全な整数積で厳密に判定します。Ziv ループ、メモリ確保、大域状態はありません。近似版の
+`cu_fdiv`、`cu_sqrt`、`operator/` は変わりません。ニュートン反復の
+一時変数のため、デバイススタックは既定の 1 KB では足りません（`PB` ≤ 512 で約 4 KB、≤ 1024 で
+8 KB、2048 で 16 KB）。`make check-fixed` が、境界から 1 W-ulp 以内になるよう構成した入力を含めて、
+`PB` = 224（サブリム）、256、512、768、1024、2048 で MPFR と照合します。
 
 **固定精度の高速パスが有利な領域（`make bench3`）。** GB10 上の AXPY `r = a·x + y`、すべて
 ビット単位で正確：
@@ -590,7 +610,7 @@ MPFR/MPC と ≤ ~1 ULP で一致** します — 検証スイートにわたり
 | `make matmul-mpfr` / `matmul-mpc` | 行列積 `C = A·B` | **~105 倍** |
 | `make bench-mpfr` / `bench-mpc` | 関数ごとの初等/超越関数ベンチマーク | 22–77 倍 |
 | `make sample-fixed` | 固定精度 `cu_freal<PB>` / `cu_fcomplex<PB>`（実数 + 複素数） | ヘッダオンリー、ビット単位で正確 |
-| `make check-fixed` | `cu_freal`/`cu_fcomplex` をシステム MPFR/MPC と照合、PB = 32…2048 | すべてビット単位で一致 |
+| `make check-fixed` | `cu_freal`/`cu_fcomplex`（と `cu_fdiv_rn`/`cu_sqrt_rn`）をシステム MPFR/MPC と照合、PB = 32…2048 | すべてビット単位で一致 |
 | `make check-fmath` | 固定精度初等関数の MPFR/MPC に対する ULP 精度 | ≤1 ULP（スイートでは 0） |
 | `make bench3` | AXPY 128..8192 ビット：GPU `cu_freal` 対 GPU `cu_mpfr` 対 CPU MPFR | クロスオーバーのスイープ（上記） |
 | `make coexist` | 1 バイナリ内の `cu_mpfr`（GPU）+ システム `libmpfr`（CPU） | π、log 2 が一致 |
